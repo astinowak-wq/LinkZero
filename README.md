@@ -22,6 +22,13 @@ curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/in
 wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
 ```
 
+Important: The installer will NOT modify your system firewall by default when run directly from GitHub for safety. If you want the installer to make firewall changes during installation, run the installer with ALLOW_FIREWALL_CHANGES=1 in the environment. Example:
+
+```bash
+# Allow installer to make firewall changes
+ALLOW_FIREWALL_CHANGES=1 curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+```
+
 ## Usage
 
 ### Basic Usage

@@ -3,8 +3,9 @@
 # LinkZero Installation Script
 # Quick installer for CloudLinux SMTP security
 #
-# Usage: curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/install.sh | sudo bash
-# Or: wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/install.sh | sudo bash
+# Usage: curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+# To allow firewall changes during install from GitHub, prefix with: ALLOW_FIREWALL_CHANGES=1
+# Example: ALLOW_FIREWALL_CHANGES=1 sudo bash -c "curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | bash"
 #
 
 set -euo pipefail
@@ -60,16 +61,37 @@ chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 log_info "Configuring firewall rules..."
 
 # Begin LinkZero firewalld/cPanel integration
+# Firewall changes are disabled by default when running the installer directly from GitHub.
+# To enable firewall changes during install, set ALLOW_FIREWALL_CHANGES=1 in the environment.
+
 if command -v firewall-cmd >/dev/null 2>&1; then
-  echo "Detected firewalld — using script/firewalld-support.sh helper"
-  script/firewalld-support.sh enable || true
-  script/firewalld-support.sh add-interface "${WAN_IF:-eth0}" public || true
-  script/firewalld-support.sh add-masquerade public || true
-  # If cPanel/CSF is present, the helper will delegate add-port/remove-port to CSF. Still call add-port for LinkZero ports.
-  script/firewalld-support.sh add-port "${WG_PORT:-51820}" udp public || true
-  script/firewalld-support.sh add-port "${API_PORT:-8080}" tcp public || true
+  if [[ "${ALLOW_FIREWALL_CHANGES:-0}" == "1" ]]; then
+    echo "Detected firewalld — ALLOW_FIREWALL_CHANGES=1 set, applying firewall changes using remote helper"
+
+    TMPDIR=$(mktemp -d)
+    helper_url="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/firewalld-support.sh"
+    if command -v curl >/dev/null 2>&1; then
+      curl -sSL "$helper_url" -o "$TMPDIR/firewalld-support.sh" || true
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q "$helper_url" -O "$TMPDIR/firewalld-support.sh" || true
+    fi
+
+    if [[ -f "$TMPDIR/firewalld-support.sh" ]]; then
+      chmod +x "$TMPDIR/firewalld-support.sh"
+      # Use the helper from the temp dir
+      "$TMPDIR/firewalld-support.sh" enable || true
+      "$TMPDIR/firewalld-support.sh" add-interface "${WAN_IF:-eth0}" public || true
+      "$TMPDIR/firewalld-support.sh" add-masquerade public || true
+      "$TMPDIR/firewalld-support.sh" add-port "${WG_PORT:-51820}" udp public || true
+      "$TMPDIR/firewalld-support.sh" add-port "${API_PORT:-8080}" tcp public || true
+      rm -rf "$TMPDIR"
+    else
+      log_warn "Could not download firewalld helper; skipping firewall configuration"
+    fi
+  else
+    echo "Detected firewalld — installer will NOT modify firewall (set ALLOW_FIREWALL_CHANGES=1 to enable)"
+  fi
 else
-  # existing iptables/nftables logic remains unchanged for systems without firewalld
   echo "firewalld not found; keeping existing firewall configuration path"
 fi
 # End LinkZero firewalld/cPanel integration
