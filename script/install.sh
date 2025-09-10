@@ -61,13 +61,13 @@ log_info "Configuring firewall rules..."
 
 # Begin LinkZero firewalld/cPanel integration
 if command -v firewall-cmd >/dev/null 2>&1; then
-  echo "Detected firewalld — using scripts/firewalld-support.sh helper"
-  scripts/firewalld-support.sh enable || true
-  scripts/firewalld-support.sh add-interface "${WAN_IF:-eth0}" public || true
-  scripts/firewalld-support.sh add-masquerade public || true
+  echo "Detected firewalld — using script/firewalld-support.sh helper"
+  script/firewalld-support.sh enable || true
+  script/firewalld-support.sh add-interface "${WAN_IF:-eth0}" public || true
+  script/firewalld-support.sh add-masquerade public || true
   # If cPanel/CSF is present, the helper will delegate add-port/remove-port to CSF. Still call add-port for LinkZero ports.
-  scripts/firewalld-support.sh add-port "${WG_PORT:-51820}" udp public || true
-  scripts/firewalld-support.sh add-port "${API_PORT:-8080}" tcp public || true
+  script/firewalld-support.sh add-port "${WG_PORT:-51820}" udp public || true
+  script/firewalld-support.sh add-port "${API_PORT:-8080}" tcp public || true
 else
   # existing iptables/nftables logic remains unchanged for systems without firewalld
   echo "firewalld not found; keeping existing firewall configuration path"

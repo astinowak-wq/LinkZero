@@ -16,10 +16,10 @@ Disable unencrypted communication on port 25 and enforce secure SMTP connections
 
 ```bash
 # One-line installer (recommended)
-curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
 
 # Alternative with wget
-wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/install.sh | sudo bash
+wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
 ```
 
 ## Usage
@@ -67,7 +67,7 @@ Options:
 | CSF | `/etc/csf/csf.conf` | ✅ Supported |
 | firewalld | System service | ✅ Supported |
 
-If your system uses cPanel/CSF, the installer will detect CSF and use it to open ports via `/etc/csf/csf.conf`. Firewalld is supported via `scripts/firewalld-support.sh`.
+If your system uses cPanel/CSF, the installer will detect CSF and use it to open ports via `/etc/csf/csf.conf`. Firewalld is supported via `script/firewalld-support.sh`.
 
 ## Supported Mail Servers
 
