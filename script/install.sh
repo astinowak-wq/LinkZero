@@ -64,7 +64,6 @@ try_open_tty() {
     exec 3<&- 2>/dev/null || true
 
     if [[ -r /dev/tty ]]; then
-        # If we can open /dev/tty for read, treat that as a usable terminal input fd.
         if exec 3</dev/tty 2>/dev/null; then
             USE_TTY_FD=true
             return 0
@@ -87,6 +86,7 @@ try_open_tty() {
 }
 
 # read a single key (blocking first byte). Prefer fd3 when available.
+# sets global 'key'
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
@@ -168,24 +168,55 @@ install_action() {
     log "Installed to $install_path"
 }
 
+# Uninstall: remove files that were created by installation.
+# We remove the main installed script and a small set of well-known dirs (if present).
+# The user is prompted unless --yes was provided.
 uninstall_action() {
     local install_path="$INSTALL_DIR/$SCRIPT_NAME"
-    if [[ ! -f "$install_path" ]]; then
-        warn "Not installed: $install_path"; return 0
+    local targets=("$install_path" "/etc/linkzero" "/usr/local/share/linkzero" "/var/lib/linkzero")
+    local any_found=false
+
+    # Collect existing targets
+    local to_remove=()
+    for t in "${targets[@]}"; do
+        if [[ -e "$t" ]]; then
+            to_remove+=("$t")
+            any_found=true
+        fi
+    done
+
+    if [[ "$any_found" != true ]]; then
+        warn "Nothing to remove. No known LinkZero files found."
+        return 0
     fi
+
+    echo "The following items will be removed:"
+    for t in "${to_remove[@]}"; do
+        echo "  $t"
+    done
+
     if [[ "$YES" != true ]]; then
-        echo "Confirm removal (Enter to remove, any other key to cancel):"
+        echo ""
+        echo -n "Confirm removal (y/N): "
+        # read a single key for yes/no
         read_key
-        if [[ -z "$key" ]]; then
-            warn "No interactive input — cancelling uninstall."
-            return 0
-        fi
-        if [[ "$key" != $'\n' && "$key" != $'\r' ]]; then
-            warn "Uninstall cancelled."
-            return 0
-        fi
+        # normalize key
+        case "$key" in
+            [yY]) ;; # proceed
+            *) warn "Uninstall cancelled."; return 0 ;;
+        esac
     fi
-    rm -f "$install_path" && log "Removed $install_path"
+
+    # Perform removal (be conservative and report results)
+    for t in "${to_remove[@]}"; do
+        if [[ -d "$t" ]]; then
+            rm -rf -- "$t" && log "Removed directory $t" || warn "Failed to remove $t"
+        else
+            rm -f -- "$t" && log "Removed file $t" || warn "Failed to remove $t"
+        fi
+    done
+
+    log "Uninstall completed."
 }
 
 # If explicit action requested, do it and exit
@@ -222,6 +253,7 @@ options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 # Preselect Uninstall if the script appears already installed.
 # This improves UX: users who already have LinkZero installed are likely trying to uninstall.
 # Override: use --install or --uninstall flags, or --interactive to force the menu.
+declare -i sel=0
 if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
     sel=1
 else
@@ -231,16 +263,22 @@ fi
 tput civis 2>/dev/null || true
 echo "Use the arrow keys and Enter to choose."
 
-while true; do
+# helper: redraw menu
+redraw_menu() {
     printf "\n"
     for i in "${!options[@]}"; do
-        if [[ $i -eq $sel ]]; then
+        if (( i == sel )); then
             printf "  \033[7m%s\033[0m\n" "${options[$i]}"
         else
             printf "   %s\n" "${options[$i]}"
         fi
     done
+}
 
+# initial draw
+redraw_menu
+
+while true; do
     read_key
 
     # if read_key produced empty key, bail to non-interactive
@@ -255,21 +293,41 @@ while true; do
     case "$key" in
         $'\n'|$'\r')
             tput cnorm 2>/dev/null || true
-            case $sel in
-                0) exec 3<&- 2>/dev/null || true; install_action; exit 0 ;;
-                1) exec 3<&- 2>/dev/null || true; uninstall_action; exit 0 ;;
-                2) exec 3<&- 2>/dev/null || true; echo "Exit."; exit 0 ;;
+            # use arithmetic evaluation to ensure sel is treated as integer
+            case $((sel)) in
+                0)
+                    exec 3<&- 2>/dev/null || true
+                    install_action
+                    exit 0
+                    ;;
+                1)
+                    exec 3<&- 2>/dev/null || true
+                    uninstall_action
+                    exit 0
+                    ;;
+                2)
+                    exec 3<&- 2>/dev/null || true
+                    echo "Exit."
+                    exit 0
+                    ;;
             esac
             ;;
-        $'\x1b[A'|$'\x1b[D')
-            sel=$(( (sel-1 + ${#options[@]}) % ${#options[@]} ))
-            tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 ))
+        $'\x1b[A'|$'\x1b[D') # up/left
+            sel=$(( (sel - 1 + ${#options[@]}) % ${#options[@]} ))
+            # move cursor up the number of menu lines + 1 blank line
+            lines_to_move=$(( ${#options[@]} + 1 ))
+            tput cuu "$lines_to_move" 2>/dev/null || printf '\033[%dA' "$lines_to_move"
+            redraw_menu
             ;;
-        $'\x1b[B'|$'\x1b[C')
-            sel=$(( (sel+1) % ${#options[@]} ))
-            tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 ))
+        $'\x1b[B'|$'\x1b[C') # down/right
+            sel=$(( (sel + 1) % ${#options[@]} ))
+            lines_to_move=$(( ${#options[@]} + 1 ))
+            tput cuu "$lines_to_move" 2>/dev/null || printf '\033[%dA' "$lines_to_move"
+            redraw_menu
             ;;
-        *) ;;
+        *)
+            # ignore other keys
+            ;;
     esac
 done
 
