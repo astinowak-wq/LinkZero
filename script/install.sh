@@ -1,7 +1,8 @@
 #!/bin/bash
 #
-# LinkZero Installation Script (fixed: exit after menu selection)
-# Robust interactive menu when piped into sudo bash.
+# LinkZero Installation Script (blocking menu input fix)
+# Reads interactive input from /dev/tty on fd 3 and blocks until a key is pressed,
+# preventing the menu from continuously redrawing when there's no user input.
 #
 set -euo pipefail
 
@@ -53,19 +54,25 @@ if [[ -n "$DEBUG" ]]; then
       "${TERM:-}"
 fi
 
-# read single key (escape sequences) using fd3 when available
+# read single key (escape sequences).
+# First read blocks until at least one byte is available (no timeout).
+# If the first byte is ESC, read up to 2 more bytes with a tiny timeout
+# so arrow sequences are captured without blocking indefinitely.
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
-        IFS= read -rsn1 -t 0.1 key <&3 2>/dev/null || key=''
+        # blocking read from fd 3 (user's terminal)
+        IFS= read -rsn1 key <&3 2>/dev/null || key=''
         if [[ $key == $'\x1b' ]]; then
-            IFS= read -rsn2 -t 0.0005 rest <&3 2>/dev/null || rest=''
+            # try to read the remainder of escape seq but don't block forever
+            IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || rest=''
             key+="$rest"
         fi
     else
-        IFS= read -rsn1 -t 0.1 key 2>/dev/null || key=''
+        # blocking read from stdin (fallback)
+        IFS= read -rsn1 key 2>/dev/null || key=''
         if [[ $key == $'\x1b' ]]; then
-            IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
+            IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=''
             key+="$rest"
         fi
     fi
@@ -178,6 +185,7 @@ uninstall_action() {
                         printf "  %s" "${opts[$i]}"
                     fi
                 done
+                # blocking read for user keypress
                 read_key
                 case "$key" in
                     $'\n'|$'\r') printf "\n"; break ;;
@@ -276,6 +284,7 @@ if [[ "$SHOW_MENU" == true ]]; then
                 printf "   %s\n" "${options[$i]}"
             fi
         done
+        # BLOCKING: wait for user keypress (prevents continuous redraw)
         read_key
         case "$key" in
             $'\n'|$'\r')
@@ -286,8 +295,15 @@ if [[ "$SHOW_MENU" == true ]]; then
                     2) echo "Exiting."; exec 3<&- 2>/dev/null || true; exit 0 ;;
                 esac
                 ;;
-            $'\x1b[A'|$'\x1b[D') sel=$(( (sel-1 + ${#options[@]}) % ${#options[@]} )); tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 )) ;;
-            $'\x1b[B'|$'\x1b[C') sel=$(( (sel+1) % ${#options[@]} )); tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 )) ;;
+            $'\x1b[A'|$'\x1b[D')
+                sel=$(( (sel-1 + ${#options[@]}) % ${#options[@]} ))
+                # move cursor up to overwrite menu
+                tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 ))
+                ;;
+            $'\x1b[B'|$'\x1b[C')
+                sel=$(( (sel+1) % ${#options[@]} ))
+                tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 ))
+                ;;
             *) ;;
         esac
     done
