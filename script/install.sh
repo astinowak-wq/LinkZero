@@ -63,51 +63,56 @@ download_script_to_temp(){
     fi
 }
 
-# helper to print either to /dev/tty (if available) or stdout
-display() {
-    # usage: display "some text"
+# robust helper to print to the user's terminal when available
+_output_dev() {
+    # prefer /dev/tty (works when running via sudo or when script is piped)
     if [[ -r /dev/tty ]]; then
-        printf "%b\n" "$1" >/dev/tty
+        printf "%b" "$1" > /dev/tty
     else
-        printf "%b\n" "$1"
+        printf "%b" "$1"
     fi
 }
 
-# show a one-line, updating countdown message (prints to /dev/tty if possible)
+# robust countdown + launch helper
 countdown_and_launch() {
     local install_path="$1"
     local seconds=${2:-5}
+    local outdev
+    if [[ -r /dev/tty ]]; then outdev="/dev/tty"; else outdev="/dev/stdout"; fi
 
-    # Only do interactive countdown if we have a tty to show it on
-    if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
-        # Use /dev/tty when available so piping into bash works.
-        local out="/dev/tty"
-        if [[ ! -r /dev/tty ]]; then out="/dev/stdout"; fi
+    printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$outdev"
 
-        printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$out"
-        # one-line updating countdown
-        for ((i=seconds;i>=1;i--)); do
-            printf "\r%bStarting in %d... %b" "$ORANGE" "$i" "$NC" >"$out"
-            # flush
-            sleep 1
-        done
-        printf "\n" >"$out"
+    # one-line updating countdown
+    for ((i=seconds;i>=1;i--)); do
+        # print with carriage return so it updates on one line
+        printf "\r%bStarting in %d... %b" "$ORANGE" "$i" "$NC" >"$outdev"
+        # flush by redirecting nothing; sleep does implicit flush
+        sleep 1
+    done
+    printf "\n" >"$outdev"
 
-        if [[ -x "$install_path" ]]; then
-            printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$out"
-            # exec so the installed program takes over the terminal/session
-            exec "$install_path"
+    if [[ -x "$install_path" ]]; then
+        printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$outdev"
+
+        # If we have a tty, attach the program to it by redirecting stdio to /dev/tty.
+        # Use exec so the installed program replaces the installer process (user's expectation).
+        if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
+            # try exec with proper fd redirection; if that fails fall back to direct exec
+            if exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty; then
+                : # replaced by program
+            else
+                # fallback attempt without explicit redirection
+                exec "$install_path" || {
+                    warn "Failed to exec ${install_path}"
+                }
+            fi
         else
-            printf "%b\n" "${YELLOW}Installed file not executable or missing: ${install_path}${NC}" >"$out"
-        fi
-    else
-        # no interactive terminal — skip countdown, just launch in background if executable
-        if [[ -x "$install_path" ]]; then
+            # no terminal available: run in background
             log "No tty available — launching installed program in background."
             nohup "$install_path" >/dev/null 2>&1 &
-        else
-            warn "No tty and installed file is not executable."
         fi
+    else
+        printf "%b\n" "${YELLOW}Installed file not executable or missing: ${install_path}${NC}" >"$outdev"
     fi
 }
 
@@ -128,7 +133,6 @@ install_action(){
     log "Installed to $install_path"
 
     # After successful install: show countdown in orange and run the installed program (interactive only)
-    # Only proceed with interactive launch when running in an interactive environment.
     countdown_and_launch "$install_path" 5
 }
 
