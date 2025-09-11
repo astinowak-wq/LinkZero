@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 # LinkZero installer — improved tty detection (tries /dev/tty, SUDO_TTY)
+# Test: run 'sudo bash script/install.sh' (or download and run) to see Uninstall preselected when the script is already installed at /usr/local/bin/linkzero-smtp.
 #
 set -euo pipefail
 
@@ -188,7 +189,15 @@ fi
 
 # show interactive menu (we have some tty fd to read from)
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
-sel=0
+
+# Default menu selection: if LinkZero is already installed, preselect Uninstall to make it obvious
+# Override with --install/--uninstall flags or --interactive to force the menu
+if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
+    sel=1  # Uninstall LinkZero
+else
+    sel=0  # Install LinkZero
+fi
+
 tput civis 2>/dev/null || true
 echo "Use the arrow keys and Enter to choose."
 
