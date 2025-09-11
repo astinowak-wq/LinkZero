@@ -1,10 +1,10 @@
 #!/bin/bash
 #
-# LinkZero Installation Script
+# LinkZero Installation Script (updated to clean up temporary downloads)
 # Quick installer for CloudLinux SMTP security
 #
-# Usage: curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/install.sh | sudo bash
-# Or: wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/install.sh | sudo bash
+# Usage: curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+# Or: wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
 #
 
 set -euo pipefail
@@ -36,6 +36,16 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
+# Ensure temporary files are cleaned up on exit (success or failure)
+TMP_HELPER=""
+TMP_SCRIPT=""
+_cleanup() {
+    # Remove temporary files if they exist.
+    [[ -n "${TMP_HELPER:-}" && -f "$TMP_HELPER" ]] && rm -f "$TMP_HELPER" || true
+    [[ -n "${TMP_SCRIPT:-}" && -f "$TMP_SCRIPT" ]] && rm -f "$TMP_SCRIPT" || true
+}
+trap _cleanup EXIT
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
@@ -44,18 +54,49 @@ fi
 
 log_info "Installing LinkZero SMTP Security Script..."
 
-# Download the script
-if command -v curl >/dev/null 2>&1; then
-    curl -sSL "$SCRIPT_URL" -o "$INSTALL_DIR/$SCRIPT_NAME"
-elif command -v wget >/dev/null 2>&1; then
-    wget -q "$SCRIPT_URL" -O "$INSTALL_DIR/$SCRIPT_NAME"
-else
-    log_error "Neither curl nor wget found. Please install one of them."
+# Download the main script to a secure temporary file and move it into place atomically
+TMP_SCRIPT="$(mktemp -p /tmp linkzero-script-XXXXXX.sh)" || {
+    log_error "Failed to create temporary file for the main script"
     exit 1
-fi
+}
 
-# Make executable
-chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
+download_to_temp() {
+    local url="$1"
+    local dest="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -fsSL "$url" -o "$dest"; then
+            return 1
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if ! wget -q -O "$dest" "$url"; then
+            return 1
+        fi
+    else
+        return 2
+    fi
+
+    return 0
+}
+
+# Fetch main script
+case "$(download_to_temp "$SCRIPT_URL" "$TMP_SCRIPT"; echo $?)" in
+    0)
+        chmod +x "$TMP_SCRIPT"
+        # Move into place atomically
+        mv -f "$TMP_SCRIPT" "$INSTALL_DIR/$SCRIPT_NAME"
+        # Clear TMP_SCRIPT variable so trap won't try to remove the installed file
+        TMP_SCRIPT=""
+        ;;
+    1)
+        log_error "Failed to download the main script from $SCRIPT_URL"
+        exit 1
+        ;;
+    2)
+        log_error "Neither curl nor wget found. Please install one of them."
+        exit 1
+        ;;
+esac
 
 log_info "Configuring firewall rules..."
 
@@ -79,24 +120,22 @@ if [[ "$firewall_type" == "firewalld" ]]; then
     log_info "Detected firewall: firewalld"
 
     HELPER_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/firewalld-support.sh"
-    TMP_HELPER="/tmp/linkzero-firewalld-helper-$$.sh"
+    TMP_HELPER="$(mktemp -p /tmp linkzero-firewalld-helper-XXXXXX.sh)" || {
+        log_warn "Could not create temporary file for the firewalld helper; falling back to firewall-cmd directly"
+        TMP_HELPER=""
+    }
     fetched_helper=false
 
-    # Try to fetch the helper into a temporary file (do not attempt to call local script/firewalld-support.sh)
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "$HELPER_URL" -o "$TMP_HELPER"; then
-            fetched_helper=true
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        if wget -q -O "$TMP_HELPER" "$HELPER_URL"; then
+    if [[ -n "${TMP_HELPER:-}" ]]; then
+        # Try to fetch the helper into the temporary file
+        if download_to_temp "$HELPER_URL" "$TMP_HELPER"; then
+            # Ensure executable (we will run via bash to avoid noexec problems on /tmp)
+            chmod +x "$TMP_HELPER" || true
             fetched_helper=true
         fi
     fi
 
     if $fetched_helper && [[ -s "$TMP_HELPER" ]]; then
-        # Ensure executable (harmless if noexec is set; we will run via bash to avoid noexec issues)
-        chmod +x "$TMP_HELPER" || true
-
         # Run helper commands via the temporary helper file using an explicit shell so /tmp noexec won't block execution.
         bash "$TMP_HELPER" enable || true
         bash "$TMP_HELPER" add-interface "${WAN_IF:-eth0}" public || true
@@ -105,8 +144,7 @@ if [[ "$firewall_type" == "firewalld" ]]; then
         bash "$TMP_HELPER" add-port "${WG_PORT:-51820}" udp public || true
         bash "$TMP_HELPER" add-port "${API_PORT:-8080}" tcp public || true
 
-        # Clean up the temporary helper
-        rm -f "$TMP_HELPER" || true
+        # helper will be removed by the EXIT trap (_cleanup)
     else
         # Helper fetch failed: do not call a non-existent local helper. Fall back to firewall-cmd direct operations.
         log_warn "firewalld helper could not be retrieved; falling back to firewall-cmd directly"
