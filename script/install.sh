@@ -41,6 +41,29 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
+# Small helper to read a single key (and small escape sequence) from the terminal device if available.
+# This allows interactive menus to work even when the script's stdin is a pipe.
+read_key() {
+    key=''
+    # Prefer /dev/tty for user input if available (works when script is piped into bash)
+    if [[ -r /dev/tty ]]; then
+        # read 1 byte, timeout tiny so script doesn't hang if no key is pressed
+        IFS= read -rsn1 -t 0.1 key < /dev/tty 2>/dev/null || key=''
+        if [[ $key == $'\x1b' ]]; then
+            # read potential remainder of escape sequence (two bytes)
+            IFS= read -rsn2 -t 0.0005 rest < /dev/tty 2>/dev/null || rest=''
+            key+="$rest"
+        fi
+    else
+        # fallback to stdin (previous behavior)
+        IFS= read -rsn1 -t 0.1 key 2>/dev/null || key=''
+        if [[ $key == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
+            key+="$rest"
+        fi
+    fi
+}
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
@@ -64,7 +87,7 @@ for arg in "$@"; do
     esac
 done
 
-# Clear the terminal screen if interactive
+# Clear the terminal screen if interactive (stdout is a TTY)
 if [[ -t 1 ]]; then
   clear
 fi
@@ -161,7 +184,7 @@ uninstall_action() {
     fi
 
     # If user didn't pass --yes and we are interactive, still ask using yes/no chooser below.
-    if [[ "$YES" != true && -t 0 ]]; then
+    if [[ "$YES" != true && ( -t 0 || -r /dev/tty ) ]]; then
         # Provide a confirmation prompt that uses only arrows + Enter
         echo ""
         echo "Confirm removal:"
@@ -177,13 +200,8 @@ uninstall_action() {
                     printf "  %s" "${opts[$i]}"
                 fi
             done
-            # read single key
-            IFS= read -rsn1 key 2>/dev/null || key=''
-            if [[ $key == $'\x1b' ]]; then
-                # read the rest of sequence
-                IFS= read -rsn2 -t 0.0005 -u 0 rest 2>/dev/null || rest=''
-                key+="$rest"
-            fi
+            # read single key from /dev/tty when available
+            read_key
             case "$key" in
                 $'\n'|$'\r') printf "\n"; break ;;
                 $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
@@ -211,7 +229,7 @@ uninstall_action() {
             rm -f /var/log/linkzero-smtp-security.log || true
             log_info "Removed /var/log/linkzero-smtp-security.log"
         else
-            if [[ -t 0 ]]; then
+            if [[ -t 0 || -r /dev/tty ]]; then
                 echo ""
                 echo "Remove log file /var/log/linkzero-smtp-security.log?"
                 local opt_sel=0
@@ -226,11 +244,7 @@ uninstall_action() {
                             printf "  %s" "${opts[$i]}"
                         fi
                     done
-                    IFS= read -rsn1 key 2>/dev/null || key=''
-                    if [[ $key == $'\x1b' ]]; then
-                        IFS= read -rsn2 -t 0.0005 -u 0 rest 2>/dev/null || rest=''
-                        key+="$rest"
-                    fi
+                    read_key
                     case "$key" in
                         $'\n'|$'\r') printf "\n"; break ;;
                         $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
@@ -263,9 +277,10 @@ if [[ -n "$ACTION" ]]; then
 fi
 
 # Interactive menu using arrow keys + Enter only (no y/n)
-# Show interactive menu only when BOTH stdin and stdout are TTYs AND neither NONINTERACTIVE nor CI environment vars are set.
-# This reduces accidental interactive prompts when the script is piped or run in CI.
-if [[ -t 0 && -t 1 && -z "${NONINTERACTIVE:-}" && -z "${CI:-}" ]]; then
+# Show interactive menu when stdout is a TTY OR /dev/tty is readable,
+# and neither NONINTERACTIVE nor CI env vars are set.
+# This allows interaction even when the script is piped into bash.
+if { [[ -t 1 || -r /dev/tty ]] && -z "${NONINTERACTIVE:-}" && -z "${CI:-}" ; }; then
     options=("Install LinkZero" "Uninstall LinkZero" "Exit")
     sel=0
     tput civis 2>/dev/null || true
@@ -280,13 +295,8 @@ if [[ -t 0 && -t 1 && -z "${NONINTERACTIVE:-}" && -z "${CI:-}" ]]; then
                 printf "   %s\n" "${options[$i]}"
             fi
         done
-        # read a single key (arrow keys are escape sequences)
-        IFS= read -rsn1 key 2>/dev/null || key=''
-        if [[ $key == $'\x1b' ]]; then
-            # read the rest of the sequence (two more chars for arrow)
-            IFS= read -rsn2 -t 0.0005 -u 0 rest 2>/dev/null || rest=''
-            key+="$rest"
-        fi
+        # read a single key using read_key (reads from /dev/tty when available)
+        read_key
         case "$key" in
             $'\n'|$'\r')
                 # Enter pressed
