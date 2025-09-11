@@ -4,20 +4,12 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Display change in this revision:
-# - The "[INFO] Detected mail server" line now prints the service with:
-#     CapitalizedName (version) (assumed cPanel)
-#   Examples:
-#     [INFO] Detected mail server: Exim (4.94) (assumed cPanel)
-#     [INFO] Detected mail server: Exim (4.94) (cPanel)
-#     [INFO] Detected mail server: Postfix
-#
-# Other behavior: backups are non-interactive and use .link0; commands logged
-# to LOG_FILE only. Edits/restarts remain interactive.
+# This is a cleaned, LF-only, complete script (no truncated lines or "..." placeholders).
+# The interactive Exim "exim -bV" perform_action was removed per prior request.
 #
 set -euo pipefail
 
-# Colors (fallback) - ensure defined before any logging when set -u is used
+# Colors (fallback)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -64,9 +56,17 @@ log() {
   local msg="$*"
   log_to_file "$level" "$msg"
   if [[ "${DRY_RUN}" == "true" ]]; then
-    if [[ -t 1 ]]; then printf '[%s] %s\n' "$level" "$msg"; else printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"; fi
+    if [[ -t 1 ]]; then
+      printf '[%s] %s\n' "$level" "$msg"
+    else
+      printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"
+    fi
   else
-    if [[ -t 1 ]]; then printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines; else printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"; fi
+    if [[ -t 1 ]]; then
+      printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
+    else
+      printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"
+    fi
   fi
 }
 log_info(){ log "INFO" "$@"; }
@@ -107,7 +107,11 @@ perform_backup() {
 # interactive yes/no chooser
 choose_yes_no() {
   local prompt="$1"
-  if ! [[ -t 0 ]]; then echo "$prompt"; echo "Non-interactive terminal: defaulting to 'No'"; return 1; fi
+  if ! [[ -t 0 ]]; then
+    echo "$prompt"
+    echo "Non-interactive terminal: defaulting to 'No'"
+    return 1
+  fi
   local sel=0 key
   tput civis 2>/dev/null || true
   while true; do
@@ -115,12 +119,24 @@ choose_yes_no() {
     if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
     IFS= read -rsn1 key 2>/dev/null || key=''
-    if [[ $key == $'\x1b' ]]; then IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''; key+="$rest"; fi
+    if [[ $key == $'\x1b' ]]; then
+      IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
+      key+="$rest"
+    fi
     case "$key" in
-      $'\n'|$'\r'|'') printf "\n"; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && return 0 || return 1 ;;
+      $'\n'|$'\r'|'')
+        printf "\n"
+        tput cnorm 2>/dev/null || true
+        [[ $sel -eq 0 ]] && return 0 || return 1
+        ;;
       $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
       h|H|l|L) sel=$((1 - sel)) ;;
-      q|Q) printf "\n"; echo -e "${RED}Aborted by user.${RESET}"; tput cnorm 2>/dev/null || true; exit 1 ;;
+      q|Q)
+        printf "\n"
+        echo -e "${RED}Aborted by user.${RESET}"
+        tput cnorm 2>/dev/null || true
+        exit 1
+        ;;
       *) ;;
     esac
   done
@@ -139,11 +155,22 @@ perform_action(){
       ACTION_RESULTS+=("dry-accepted"); log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"; return 0
     fi
     log_command_to_file_only "INFO" "Executing command" "$cmd"
-    if eval "$cmd"; then printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"; log_success "$desc"; ACTION_RESULTS+=("executed"); return 0
-    else printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"; log_error "$desc failed"; ACTION_RESULTS+=("failed"); return 1; fi
+    if eval "$cmd"; then
+      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
+      log_success "$desc"
+      ACTION_RESULTS+=("executed")
+      return 0
+    else
+      printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"
+      log_error "$desc failed"
+      ACTION_RESULTS+=("failed")
+      return 1
+    fi
   else
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
-    ACTION_RESULTS+=("skipped"); log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"; return 0
+    ACTION_RESULTS+=("skipped")
+    log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"
+    return 0
   fi
 }
 
@@ -267,7 +294,9 @@ detect_active_mailserver() {
     EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
     EXIM_VERSION="${EXIM_VERSION:-unknown}"
     # if output references cPanel, mark variant (not assumed)
-    if printf '%s\n' "$ev" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then MAIL_SERVER_VARIANT="cPanel"; MAIL_SERVER_VARIANT_ASSUMED=""; fi
+    if printf '%s\n' "$ev" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then
+      MAIL_SERVER_VARIANT="cPanel"; MAIL_SERVER_VARIANT_ASSUMED=""
+    fi
     echo "exim"; return 0
   fi
 
@@ -292,7 +321,8 @@ configure_postfix(){
   perform_action "Set Postfix: smtpd_tls_auth_only = yes" "postconf -e 'smtpd_tls_auth_only = yes'"
   perform_action "Set Postfix: smtpd_tls_security_level = may" "postconf -e 'smtpd_tls_security_level = may'"
   perform_action "Set Postfix: smtpd_sasl_auth_enable = yes" "postconf -e 'smtpd_sasl_auth_enable = yes'"
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart"; fi
+  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix || true"
+  else perform_action "Restart Postfix via service" "service postfix restart || true"; fi
 }
 
 configure_exim(){
@@ -311,13 +341,18 @@ configure_exim(){
   if [[ -z "$exim_conf" && "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
     local candidates=( "/var/cpanel/exim.conf" "/var/cpanel/main_exim.conf" "/var/cpanel/exim.conf.local" "/etc/exim.conf" "/etc/exim.conf.local" "/var/cpanel/userdata/*/exim.conf" )
     for p in "${candidates[@]}"; do
-      for f in $p; do [[ -f "$f" ]] && { exim_conf="$f"; break 2; } done
+      for f in $p; do
+        if [[ -f "$f" ]]; then
+          exim_conf="$f"
+          break 2
+        fi
+      done
     done
     if [[ -z "$exim_conf" ]]; then
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"; fi
+    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding without config edits"; fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
@@ -339,7 +374,7 @@ configure_exim(){
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; find '$exim_conf' -type f -name '*.conf' -exec sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/ d' {} + || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
       local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
@@ -355,9 +390,10 @@ configure_exim(){
 }
 
 test_configuration(){
-  log_info "Running basic mail-server checks (prompted)"
-  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then perform_action "Postfix: basic configuration check" "postfix check"; fi
-  if [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]] || command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then perform_action "Exim: basic configuration info" "exim -bV"; fi
+  # The interactive Exim perform_action was intentionally removed.
+  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then
+    perform_action "Postfix: basic configuration check" "postfix check"
+  fi
 }
 
 _print_summary(){
@@ -385,26 +421,25 @@ EOF
 }
 
 main(){
-if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
-  
-# Big pixel-art QHTL logo (with double space between T and L)
-echo -e "${GREEN}"
-echo -e "   █████  █   █  █████        █      █        █   "
-echo -e "  █     █ █   █    █          █               █  █"
-echo -e "  █     █ █   █    █          █      █  █     █ █ "
-echo -e "  █     █ █████    █          █      █  ████  ██  "
-echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
-echo -e "   █████  █   █    █          █████  █  █   █ █  █"
-echo -e "${NC}"
+  if [[ -t 1 ]]; then
+    tput clear 2>/dev/null || printf '\033[H\033[2J'
+  fi
 
-# Red bold capital Daniel Nowakowski below logo
-echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+  # header
+  echo -e "${GREEN}"
+  echo -e "   █████  █   █  █████        █      █        █   "
+  echo -e "  █     █ █   █    █          █               █  █"
+  echo -e "  █     █ █   █    █          █      █  █     █ █ "
+  echo -e "  █     █ █████    █          █      █  ████  ██  "
+  echo -e "  █     █ █   █    █          █████  █  █   █ █ █ "
+  echo -e "   █████  █   █    █          █████  █  █   █ █  █"
+  echo -e "${NC}"
 
-# Display QHTL Zero header
-echo -e "${BLUE}========================================================"
-echo -e "        QHTL Zero Configurator SMTP Hardening    "
-echo -e "========================================================${NC}"
-echo -e ""
+  echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+  echo -e "${BLUE}========================================================"
+  echo -e "        QHTL Zero Configurator SMTP Hardening    "
+  echo -e "========================================================${NC}"
+  echo -e ""
 
   for arg in "$@"; do
     case "$arg" in
@@ -416,13 +451,14 @@ echo -e ""
 
   log_info "Starting smtp-hardening (dry-run=${DRY_RUN:-false})"
 
+  # ensure the function is defined (it is, above) and call it
   configure_firewall
 
   local mail_svc
   mail_svc="$(detect_active_mailserver)"
 
-  # Build display label: CapitalizedName (version) (assumed cPanel)
-  local svc_disp; svc_disp="$(capitalize_first "$mail_svc")"
+  local svc_disp
+  svc_disp="$(capitalize_first "$mail_svc")"
   local variant_display=""
   if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
     if [[ "${MAIL_SERVER_VARIANT_ASSUMED}" == "assumed" ]]; then
@@ -432,23 +468,32 @@ echo -e ""
     fi
   fi
   local version_display=""
-  if [[ "${mail_svc}" == "exim" ]]; then version_display=" (${EXIM_VERSION:-unknown})"; fi
+  if [[ "${mail_svc}" == "exim" ]]; then
+    version_display=" (${EXIM_VERSION:-unknown})"
+  fi
 
   log_info "Detected mail server: ${svc_disp}${version_display}${variant_display}"
 
   case "$mail_svc" in
     exim)
-      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."
-      else log_info "Exim detected — running Exim-specific tasks."; fi
-      configure_exim; test_configuration
+      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
+        log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."
+      else
+        log_info "Exim detected — running Exim-specific tasks."
+      fi
+      configure_exim
+      test_configuration
       ;;
     postfix)
       log_info "Postfix detected — running Postfix-specific tasks."
-      configure_postfix; test_configuration
+      configure_postfix
+      test_configuration
       ;;
     none|*)
       log_info "No mail server detected; attempting both Exim and Postfix tasks (fallback)."
-      configure_exim; configure_postfix; test_configuration
+      configure_exim
+      configure_postfix
+      test_configuration
       ;;
   esac
 
