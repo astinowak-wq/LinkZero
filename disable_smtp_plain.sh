@@ -4,20 +4,13 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Changes:
-# - Robust CSF detection so CSF is chosen as primary on cPanel systems where
-#   CSF may be installed in non-standard paths or run under different service
-#   names (csf/lfd). Detection checks:
-#     - systemctl for csf/lfd
-#     - pgrep for csf/lfd processes
-#     - existence of common install paths (/etc/csf, /usr/local/csf, /usr/sbin/csf)
-#     - cPanel presence (/usr/local/cpanel) combined with CSF paths
-# - CSF detection runs before nftables so CSF wins when present even if nft
-#   binaries are available.
-# - Screen is cleared at start of run.
-# - Interactive chooser highlights the currently-selected answer by coloring it
-#   (YES=green, NO=red) while leaving the unselected option in the terminal's
-#   default color so it remains visible on any background.
+# Changes in this revision:
+# - Do not print the actual command or any "Command:" lines to the terminal.
+# - Replace the previous "Accepted" / "Skipped" messages with a single concise,
+#   colored result message:
+#     - Green: "Changes has been successfully applied" (if action executed or dry-run)
+#     - Red:   "Changes has been rejected by user" (if user answered No)
+# - On actual command failure the script still reports the failure in red.
 #
 set -euo pipefail
 
@@ -215,34 +208,43 @@ perform_action(){
   local desc="$1"; shift
   local cmd="$*"
 
+  # Show only the action (no "Command:" or other command info printed to terminal)
   echo -e "${CYAN}${BOLD}Action:${RESET} ${desc}"
-  echo -e "${YELLOW}Command:${RESET} ${cmd}"
+
+  # record the command internally so we can show statuses and log it, but do NOT print "Command:" to stdout.
+  ACTION_DESCS+=("$desc")
+  ACTION_CMDS+=("$cmd")
+
+  # log the planned command (not shown to terminal)
+  log_info "Planned command for action: $cmd"
 
   if choose_yes_no "Apply?"; then
-    ACTION_DESCS+=("$desc")
-    ACTION_CMDS+=("$cmd")
-
+    # User answered YES
     if [[ "${DRY_RUN}" == "true" ]]; then
-      echo -e "${GREEN}Accepted (dry-run): would run:${RESET} ${cmd}"
+      # dry-run: do not execute, but show confirmation message
+      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
+      log_info "DRY-RUN: would run: $cmd"
       return 0
     fi
 
-    echo -e "${GREEN}Executing:${RESET} ${cmd}"
+    # Attempt execution (no command echoed to terminal)
     if eval "$cmd"; then
+      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
       log_success "$desc"
       ACTION_RESULTS+=("executed")
       return 0
     else
+      printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"
       log_error "$desc failed"
       ACTION_RESULTS+=("failed")
       return 1
     fi
   else
-    echo -e "${MAGENTA}Skipped:${RESET} ${cmd}"
-    ACTION_DESCS+=("$desc")
-    ACTION_CMDS+=("$cmd")
+    # User answered NO -> show rejection message in red (no "Skipped:" line)
+    printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped")
+    log_info "User rejected action: $desc (command: $cmd)"
     return 0
   fi
 }
@@ -270,7 +272,6 @@ nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/de
       ;;
     csf)
       log_info "Managing CSF only; firewalld/iptables/nftables will be muted."
-      # Reload CSF and prompt for config checks (CSF manages iptables/nftables itself)
       perform_action "Reload CSF (ConfigServer) firewall" "csf -r || true"
       perform_action "Notify to ensure /etc/csf/csf.conf includes TCP_IN ports 25,587,465" \
         "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
@@ -359,16 +360,14 @@ _print_summary(){
   local i
   for i in "${!ACTION_DESCS[@]}"; do
     local d="${ACTION_DESCS[$i]}"
-    local c="${ACTION_CMDS[$i]}"
     local r="${ACTION_RESULTS[$i]}"
     case "$r" in
       executed)     printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "$GREEN" "$RESET" "$d" ;;
       failed)       printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
-      skipped)      printf "%s %b[SKIPPED]%b  — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
-      dry-accepted) printf "%s %b[DRY-ACCEPT]%b — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
+      skipped)      printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
+      dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
       *)             printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
     esac
-    printf "    Command: %s\n" "$c"
   done
 }
 
