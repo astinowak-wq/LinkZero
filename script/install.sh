@@ -35,7 +35,7 @@ echo -e "========================================================${NC}"
 echo ""
 
 # Config
-SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable_smtp_plain.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/danpolltd/LinkZero/main/disable_smtp_plain.sh"
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="linkzero-smtp"
 
