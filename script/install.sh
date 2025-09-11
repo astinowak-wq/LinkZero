@@ -43,6 +43,10 @@ if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
     exit 1
 fi
+
+# Clear the terminal screen
+clear
+
 # Big pixel-art QHTL logo (with double space between T and L)
 echo -e "${GREEN}"
 echo -e "   █████  █   █  █████        █      █        █   "
