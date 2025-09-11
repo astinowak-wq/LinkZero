@@ -4,13 +4,20 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Behavior summary:
-# - Clears the screen at the start of each run so the interactive menu is visible.
-# - Detects the active firewall manager (priority: csf > nftables > firewalld > iptables)
-#   and only presents/actions for the detected manager.
-# - Interactive Yes/No chooser: selected option is colored (YES=green, NO=red),
-#   unselected option uses the terminal default color so it's visible on any background.
-# - --dry-run prevents any commands from actually running; accepted actions are recorded as "would run".
+# Changes:
+# - Robust CSF detection so CSF is chosen as primary on cPanel systems where
+#   CSF may be installed in non-standard paths or run under different service
+#   names (csf/lfd). Detection checks:
+#     - systemctl for csf/lfd
+#     - pgrep for csf/lfd processes
+#     - existence of common install paths (/etc/csf, /usr/local/csf, /usr/sbin/csf)
+#     - cPanel presence (/usr/local/cpanel) combined with CSF paths
+# - CSF detection runs before nftables so CSF wins when present even if nft
+#   binaries are available.
+# - Screen is cleared at start of run.
+# - Interactive chooser highlights the currently-selected answer by coloring it
+#   (YES=green, NO=red) while leaving the unselected option in the terminal's
+#   default color so it remains visible on any background.
 #
 set -euo pipefail
 
@@ -58,18 +65,42 @@ log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
+# Robust CSF presence check.
+csf_present() {
+  # 1) systemctl services
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet csf 2>/dev/null || systemctl is-active --quiet lfd 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  # 2) running processes (csf or lfd)
+  if pgrep -x csf >/dev/null 2>&1 || pgrep -x lfd >/dev/null 2>&1 || pgrep -f '/usr/local/csf' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # 3) common install paths
+  if [[ -d /etc/csf ]] || [[ -d /usr/local/csf ]] || [[ -x /usr/sbin/csf ]] || [[ -x /usr/local/sbin/csf ]]; then
+    return 0
+  fi
+
+  # 4) cPanel indicator + csf dir (often cPanel systems have /usr/local/cpanel)
+  if [[ -d /usr/local/cpanel ]] && ([[ -d /etc/csf ]] || [[ -d /usr/local/csf ]]); then
+    return 0
+  fi
+
+  return 1
+}
+
 # Detect the active firewall manager.
 # Priority: csf > nftables > firewalld > iptables > none
 detect_active_firewall() {
-  if command -v csf >/dev/null 2>&1; then
-    echo "csf"
-    return 0
-  fi
-  if [[ -d /etc/csf ]]; then
+  if csf_present; then
     echo "csf"
     return 0
   fi
 
+  # nftables next
   if command -v nft >/dev/null 2>&1; then
     if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then
       echo "nftables"
@@ -77,6 +108,7 @@ detect_active_firewall() {
     fi
   fi
 
+  # firewalld
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state >/dev/null 2>&1; then
       if firewall-cmd --state 2>/dev/null | grep -qi running; then
@@ -89,6 +121,7 @@ detect_active_firewall() {
     fi
   fi
 
+  # iptables fallback
   if command -v iptables-save >/dev/null 2>&1; then
     echo "iptables"
     return 0
@@ -350,7 +383,6 @@ EOF
 main(){
   # Clear the screen at the beginning of every run so the interactive menu is visible.
   if [[ -t 1 ]]; then
-    # Prefer tput clear, fallback to ANSI reset/clear
     tput clear 2>/dev/null || printf '\033[H\033[2J'
   fi
 
