@@ -407,7 +407,7 @@ EOF
 }
 
 main(){
-  if [[ -t 1 ]]; then tput 2>/dev/null || printf '\033[H\033[2J'; fi
+  
 
   for arg in "$@"; do
     case "$arg" in
