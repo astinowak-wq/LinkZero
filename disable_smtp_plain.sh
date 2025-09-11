@@ -105,13 +105,13 @@ perform_backup() {
 }
 
 # interactive yes/no chooser
-# Updated: read from /dev/tty (or SUDO_TTY) to ensure prompts work even when stdin is redirected.
-# Returns 0 for Yes, 1 for No. If no tty available, defaults to No (returns 1) and informs user.
+# Reworked to use the controlling terminal (/dev/tty or SUDO_TTY) so prompts behave
+# correctly even when stdin/stdout are redirected. Returns 0 for "Yes", 1 for "No".
 choose_yes_no() {
   local prompt="$1"
   local ttydev=""
 
-  # Prefer /dev/tty, fall back to SUDO_TTY if present and readable
+  # Prefer /dev/tty; fall back to SUDO_TTY if provided by sudo
   if [[ -r /dev/tty ]]; then
     ttydev="/dev/tty"
   elif [[ -n "${SUDO_TTY:-}" && -r "${SUDO_TTY}" ]]; then
@@ -119,27 +119,32 @@ choose_yes_no() {
   fi
 
   if [[ -z "$ttydev" ]]; then
-    # Non-interactive environment: do not attempt to prompt; default to No
+    # Non-interactive environment: do not prompt; default to "No"
     echo "$prompt"
     echo "Non-interactive terminal: defaulting to 'No'"
     return 1
   fi
 
-  # Open tty for reading single-key input on fd 3
+  # Open the terminal for reading single-key input on fd 3
   exec 3<"$ttydev" 2>/dev/null || return 1
 
   local sel=0 key rest
   tput civis >/dev/null 2>&1 || true
+
   while true; do
-    # Print prompt to tty (clearing the line first)
+    # Clear the line and print prompt to the tty
     printf '\r\033[K' >"$ttydev"
-    if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
+    if [[ $sel -eq 0 ]]; then
+      option_yes="${GREEN}YES${RESET}"; option_no="NO"
+    else
+      option_yes="YES"; option_no="${RED}NO${RESET}"
+    fi
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >"$ttydev"
 
-    # Read a single key (handle escape sequences for arrows)
+    # Read single key (handle escape sequences for arrows)
     IFS= read -r -n1 -u 3 key 2>/dev/null || key=''
     if [[ $key == $'\x1b' ]]; then
-      # attempt to read the rest of the escape sequence
+      # try to read the rest of the sequence (very short timeout)
       IFS= read -r -n2 -t 0.0005 -u 3 rest 2>/dev/null || rest=''
       key+="$rest"
     fi
@@ -151,12 +156,8 @@ choose_yes_no() {
         exec 3<&- 2>/dev/null || true
         [[ $sel -eq 0 ]] && return 0 || return 1
         ;;
-      $'\x1b[C'|$'\x1b[D')
-        # toggle selection on left/right arrows (also works with up/down if terminal maps)
-        sel=$((1 - sel))
-        ;;
-      $'\x1b[A'|$'\x1b[B')
-        # Up/Down arrows behave the same
+      $'\x1b[C'|$'\x1b[D'|$'\x1b[A'|$'\x1b[B')
+        # Left/Right/Up/Down toggle selection
         sel=$((1 - sel))
         ;;
       h|H|l|L)
@@ -164,7 +165,7 @@ choose_yes_no() {
         ;;
       q|Q)
         printf "\n" >"$ttydev"
-        echo -e "${RED}Aborted by user.${RESET}" >"$ttydev"
+        printf "%bAborted by user.%b\n" "${RED}" "${RESET}" >"$ttydev"
         tput cnorm >/dev/null 2>&1 || true
         exec 3<&- 2>/dev/null || true
         exit 1
