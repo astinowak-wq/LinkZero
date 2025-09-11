@@ -4,10 +4,16 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# This revision keeps the interactive two-option chooser (Yes / No), with Yes
-# in green and No in red, but removes bold from the Yes/No option text so the
-# colored menu stays clearly visible while navigating. The prompt text remains
-# highlighted in cyan (and bold) so it's still easy to spot.
+# Behavior:
+# - Detects the active firewall manager (nftables > csf > firewalld > iptables)
+#   and only presents/actions for the detected manager.
+# - Interactive Yes/No chooser: options are rendered in white by default.
+#   While navigating, the currently-selected option will change color:
+#     - YES becomes green when selected
+#     - NO becomes red when selected
+#   The option labels are not rendered in bold (so the menu stays visible).
+# - --dry-run prevents any commands from actually running; accepted actions are
+#   recorded as "would run".
 #
 set -euo pipefail
 
@@ -22,6 +28,7 @@ if [[ -t 1 ]]; then
   BLUE='\033[0;34m'
   MAGENTA='\033[0;35m'
   CYAN='\033[0;36m'
+  WHITE='\033[0;37m'
   BOLD='\033[1m'
   RESET='\033[0m'
 else
@@ -31,6 +38,7 @@ else
   BLUE=''
   MAGENTA=''
   CYAN=''
+  WHITE=''
   BOLD=''
   RESET=''
 fi
@@ -55,7 +63,12 @@ log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
-# Detect the active firewall manager (priority: nftables > csf > firewalld > iptables)
+# Detect the active firewall manager. Priority:
+# - nftables (preferred)
+# - csf (ConfigServer)
+# - firewalld
+# - iptables (fallback)
+# - none (if nothing detected)
 detect_active_firewall() {
   if command -v nft >/dev/null 2>&1; then
     if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then
@@ -119,18 +132,19 @@ choose_yes_no() {
   tput civis 2>/dev/null || true
 
   while true; do
-    # clear line and render prompt with colored options (no bold on YES/NO)
+    # clear line and render prompt with colored options (selected option colored)
     printf '\r\033[K'
 
-    # Prompt remains highlighted so it's obvious what you're answering
+    # When selected: YES -> green, NO -> red. Unselected option stays white.
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"
-      option_no="${RED}NO${RESET}"
+      option_no="${WHITE}NO${RESET}"
     else
-      option_yes="${GREEN}YES${RESET}"
+      option_yes="${WHITE}YES${RESET}"
       option_no="${RED}NO${RESET}"
     fi
 
+    # Prompt remains highlighted so it's obvious what you're answering; options are not bold.
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
 
     # read one key (raw, silent)
