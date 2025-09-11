@@ -1,14 +1,6 @@
 #!/bin/bash
 #
-# LinkZero Installation Script (tty-on-fd3 fix)
-# Reads interactive input from /dev/tty on fd 3 so menu works when piped into sudo bash.
-#
-# Usage (recommended):
-#   curl -fsSL https://.../install.sh -o install.sh
-#   sudo bash install.sh
-#
-# To test piping behavior locally:
-#   cat install.sh | sudo bash
+# LinkZero Installation Script (tty-on-fd3 fix) - corrected conditional tests
 #
 set -euo pipefail
 
@@ -16,12 +8,10 @@ SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="linkzero-smtp"
 
-# Default port variables for firewall configuration (kept for reference only)
 WG_PORT="${WG_PORT:-51820}"
 API_PORT="${API_PORT:-8080}"
 WAN_IF="${WAN_IF:-eth0}"
 
-# Colors / text styles
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -33,23 +23,19 @@ FORCE=false
 ACTION=""   # will be "install" or "uninstall" or empty
 YES=false
 
-# Debug mode if you want interactive checks printed: export DEBUG=1
 DEBUG="${DEBUG:-}"
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 
-# --- open /dev/tty on fd 3 if possible (one-time) ---
+# open /dev/tty on fd 3 if possible
 USE_TTY_FD=false
 if [[ -r /dev/tty ]]; then
-    # attempt to open as fd 3; ignore errors
     exec 3</dev/tty 2>/dev/null || true
-    # test whether fd 3 is usable for reads
     if read -t 0 -u 3 >/dev/null 2>&1; then
         USE_TTY_FD=true
     else
-        # close if not usable
         exec 3<&- 2>/dev/null || true
         USE_TTY_FD=false
     fi
@@ -65,7 +51,6 @@ if [[ -n "$DEBUG" ]]; then
       "${TERM:-}"
 fi
 
-# Small helper to read a single key (and small escape sequence) from fd 3 if available.
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
@@ -83,13 +68,11 @@ read_key() {
     fi
 }
 
-# Check if running as root
 if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
     exit 1
 fi
 
-# Parse non-interactive args
 for arg in "$@"; do
     case "$arg" in
         --uninstall|-u) ACTION="uninstall" ;;
@@ -101,10 +84,8 @@ for arg in "$@"; do
     esac
 done
 
-# Clear the terminal screen if stdout is a TTY
 if [[ -t 1 ]]; then clear; fi
 
-# Header / logo
 echo -e "${GREEN}"
 echo -e "   █████  █   █  █████        █      █        █   "
 echo -e "  █     █ █   █    █          █               █  █"
@@ -193,7 +174,7 @@ uninstall_action() {
                 $'\n'|$'\r') printf "\n"; break ;;
                 $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
                 $'\x1b[D'|$'\x1b[A') opt_sel=$(( (opt_sel-1 + ${#opts[@]}) % ${#opts[@]} )) ;;
-                *) ;; 
+                *) ;;
             esac
         done
         tput cnorm 2>/dev/null || true
@@ -252,7 +233,6 @@ uninstall_action() {
     log_info "Uninstall complete."
 }
 
-# If action provided via flags, skip interactive selection
 if [[ -n "$ACTION" ]]; then
     case "$ACTION" in
         install) install_action ;;
@@ -263,8 +243,8 @@ if [[ -n "$ACTION" ]]; then
     exit 0
 fi
 
-# Interactive menu using fd 3 for input when available.
-if { [[ -t 1 || "$USE_TTY_FD" == true ]] && -z "${NONINTERACTIVE:-}" && -z "${CI:-}" ; }; then
+# Fixed conditional: wrap -z tests in [[ ... ]]
+if { [[ -t 1 || "$USE_TTY_FD" == true ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; }; then
     options=("Install LinkZero" "Uninstall LinkZero" "Exit")
     sel=0
     tput civis 2>/dev/null || true
@@ -298,7 +278,6 @@ else
     install_action
 fi
 
-# close fd 3 if open
 exec 3<&- 2>/dev/null || true
 
 exit 0
