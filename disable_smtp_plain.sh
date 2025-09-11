@@ -4,12 +4,11 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# This revision provides an arrow-key chooser that only offers two options:
-#   Yes and No
-# The user uses left/right arrows (or h/l) to circulate between the options and
-# presses Enter to confirm. In --dry-run the script will always avoid making
-# changes even when the user chooses Yes; accepted actions in dry-run are
-# recorded as "dry-accepted".
+# This revision displays a simple two-option chooser (Yes / No). Yes is green,
+# No is red, and the currently highlighted option is shown in bold. Left/right
+# arrows (or h/l) cycle between the options and Enter confirms. In --dry-run
+# the script never performs changes even when Yes is chosen; accepted actions
+# in dry-run are recorded as "dry-accepted".
 #
 set -euo pipefail
 
@@ -80,14 +79,20 @@ choose_yes_no() {
   # hide cursor if possible
   tput civis 2>/dev/null || true
 
-  # loop until Enter
   while true; do
-    # render prompt and options; ensure we clear the line afterwards
+    # clear line and render prompt with colored options
+    printf '\r\033[K'  # CR + clear to end of line
+
     if [[ $sel -eq 0 ]]; then
-      printf "%b %s   [ %bYES%b ]  [ NO ]\r" "$CYAN$BOLD" "$prompt" "$GREEN" "$RESET"
+      option_yes="${BOLD}${GREEN}YES${RESET}"
+      option_no="${RED}NO${RESET}"
     else
-      printf "%b %s   [ YES ]  [ %bNO%b ]\r" "$CYAN$BOLD" "$prompt" "$GREEN" "$RESET"
+      option_yes="${GREEN}YES${RESET}"
+      option_no="${BOLD}${RED}NO${RESET}"
     fi
+
+    # Print: cyan bold prompt text then options
+    printf "%b %s   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "$option_yes" "$option_no"
 
     # read one key (raw, silent)
     IFS= read -rsn1 key 2>/dev/null || key=''
@@ -100,8 +105,7 @@ choose_yes_no() {
     fi
 
     case "$key" in
-      $'\n'|$'\r'|'')   # Enter (some shells give empty, some give newline)
-        # print a newline to move to the next line cleanly
+      $'\n'|$'\r'|'')   # Enter pressed
         printf "\n"
         tput cnorm 2>/dev/null || true
         if [[ $sel -eq 0 ]]; then
