@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
 # LinkZero installer — simplified interactive menu (numbered choices)
-# Uninstall no longer prompts — it deletes known installed files immediately.
+# After successful installation the installed program will be launched
+# automatically after a 5 second orange-coloured countdown (interactive only).
 #
 set -euo pipefail
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+# "Orange" (best-effort using a yellow tone; change to 38;5;214m for 256-color orange)
+ORANGE='\033[0;33m'
 
 # Header (show when stdout is a terminal)
 if [[ -t 1 ]]; then clear; fi
@@ -60,6 +63,54 @@ download_script_to_temp(){
     fi
 }
 
+# helper to print either to /dev/tty (if available) or stdout
+display() {
+    # usage: display "some text"
+    if [[ -r /dev/tty ]]; then
+        printf "%b\n" "$1" >/dev/tty
+    else
+        printf "%b\n" "$1"
+    fi
+}
+
+# show a one-line, updating countdown message (prints to /dev/tty if possible)
+countdown_and_launch() {
+    local install_path="$1"
+    local seconds=${2:-5}
+
+    # Only do interactive countdown if we have a tty to show it on
+    if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
+        # Use /dev/tty when available so piping into bash works.
+        local out="/dev/tty"
+        if [[ ! -r /dev/tty ]]; then out="/dev/stdout"; fi
+
+        printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$out"
+        # one-line updating countdown
+        for ((i=seconds;i>=1;i--)); do
+            printf "\r%bStarting in %d... %b" "$ORANGE" "$i" "$NC" >"$out"
+            # flush
+            sleep 1
+        done
+        printf "\n" >"$out"
+
+        if [[ -x "$install_path" ]]; then
+            printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$out"
+            # exec so the installed program takes over the terminal/session
+            exec "$install_path"
+        else
+            printf "%b\n" "${YELLOW}Installed file not executable or missing: ${install_path}${NC}" >"$out"
+        fi
+    else
+        # no interactive terminal — skip countdown, just launch in background if executable
+        if [[ -x "$install_path" ]]; then
+            log "No tty available — launching installed program in background."
+            nohup "$install_path" >/dev/null 2>&1 &
+        else
+            warn "No tty and installed file is not executable."
+        fi
+    fi
+}
+
 install_action(){
     log "Installing LinkZero..."
     ensure_install_dir
@@ -75,6 +126,10 @@ install_action(){
     mv "$TMP_DL" "$install_path"
     chmod +x "$install_path"
     log "Installed to $install_path"
+
+    # After successful install: show countdown in orange and run the installed program (interactive only)
+    # Only proceed with interactive launch when running in an interactive environment.
+    countdown_and_launch "$install_path" 5
 }
 
 # Uninstall: no prompt — remove known files/directories immediately.
