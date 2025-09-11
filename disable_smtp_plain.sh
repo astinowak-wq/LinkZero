@@ -4,12 +4,13 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Changes in this revision:
-# - Fix visibility of the interactive chooser: unselected answers are rendered
-#   in the terminal default color (no explicit "white" color sequence) so they
-#   aren't invisible on white/bright backgrounds. The currently-selected
-#   option is rendered in color (green for YES, red for NO) while you move
-#   the arrows. Options remain non-bold per your earlier request.
+# Behavior summary:
+# - Clears the screen at the start of each run so the interactive menu is visible.
+# - Detects the active firewall manager (priority: csf > nftables > firewalld > iptables)
+#   and only presents/actions for the detected manager.
+# - Interactive Yes/No chooser: selected option is colored (YES=green, NO=red),
+#   unselected option uses the terminal default color so it's visible on any background.
+# - --dry-run prevents any commands from actually running; accepted actions are recorded as "would run".
 #
 set -euo pipefail
 
@@ -57,27 +58,21 @@ log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
-# Detect the active firewall manager. Priority:
-# - nftables (preferred)
-# - csf (ConfigServer)
-# - firewalld
-# - iptables (fallback)
-# - none (if nothing detected)
+# Detect the active firewall manager.
+# Priority: csf > nftables > firewalld > iptables > none
 detect_active_firewall() {
+  if command -v csf >/dev/null 2>&1; then
+    echo "csf"
+    return 0
+  fi
+  if [[ -d /etc/csf ]]; then
+    echo "csf"
+    return 0
+  fi
+
   if command -v nft >/dev/null 2>&1; then
     if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then
       echo "nftables"
-      return 0
-    fi
-  fi
-
-  if command -v csf >/dev/null 2>&1 || [[ -d /etc/csf ]]; then
-    if command -v csf >/dev/null 2>&1; then
-      echo "csf"
-      return 0
-    fi
-    if [[ -d /etc/csf ]]; then
-      echo "csf"
       return 0
     fi
   fi
@@ -129,8 +124,7 @@ choose_yes_no() {
     # clear line and render prompt with colored selected option
     printf '\r\033[K'
 
-    # IMPORTANT: unselected option uses the terminal default color (no explicit white),
-    # selected option uses green (YES) or red (NO) so it's visible on any background.
+    # Selected option uses color, unselected uses terminal default color
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"
       option_no="NO"
@@ -242,7 +236,8 @@ nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/de
         "$nft_base nft add rule inet linkzero input tcp dport 465 accept >/dev/null 2>&1 || true"
       ;;
     csf)
-      log_info "Managing CSF only; firewalld/iptables will be muted."
+      log_info "Managing CSF only; firewalld/iptables/nftables will be muted."
+      # Reload CSF and prompt for config checks (CSF manages iptables/nftables itself)
       perform_action "Reload CSF (ConfigServer) firewall" "csf -r || true"
       perform_action "Notify to ensure /etc/csf/csf.conf includes TCP_IN ports 25,587,465" \
         "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
@@ -262,7 +257,7 @@ nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/de
       ;;
     none|*)
       log_info "No recognized firewall manager detected; skipping firewall changes."
-      echo -e "${YELLOW}No active firewall manager detected (nftables, csf, firewalld, iptables).${RESET}"
+      echo -e "${YELLOW}No active firewall manager detected (csf, nftables, firewalld, iptables).${RESET}"
       ;;
   esac
 }
@@ -353,6 +348,12 @@ EOF
 }
 
 main(){
+  # Clear the screen at the beginning of every run so the interactive menu is visible.
+  if [[ -t 1 ]]; then
+    # Prefer tput clear, fallback to ANSI reset/clear
+    tput clear 2>/dev/null || printf '\033[H\033[2J'
+  fi
+
   for arg in "$@"; do
     case "$arg" in
       --dry-run) DRY_RUN=true ;;
