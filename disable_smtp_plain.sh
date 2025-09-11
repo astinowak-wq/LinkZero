@@ -4,13 +4,7 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Fixes in this version:
-# - perform_action: do NOT prompt when DRY_RUN=true (show what would run only).
-# - choose_yes_no: interact directly with /dev/tty (fd 3), drain pending bytes
-#   to avoid accidental immediate acceptance, restore terminal state, and
-#   always close the opened fd so the script can't leave a dangling descriptor.
-# - add trap to restore terminal state on exit.
-#
+# Simplified, robust interactive prompt and strict --dry-run behavior.
 set -euo pipefail
 
 # Ensure terminal state restored on exit
@@ -107,72 +101,32 @@ perform_backup() {
   fi
 }
 
-# interactive yes/no chooser (robust)
-# - interacts with /dev/tty directly (fd 3) when available
-# - drains pending input to avoid accidental immediate acceptance
-# - single-key UI with arrow/h/l, Enter to accept
-# - closes fd 3 and restores terminal state before returning
+# Very robust, simple interactive yes/no prompt using /dev/tty
+# - Reads a full line from /dev/tty (blocking)
+# - Accepts y/yes (case-insensitive) as Yes, anything else -> No
+# - Returns 0 on Yes, 1 on No
 choose_yes_no() {
   local prompt="$1"
-  local sel=0 key rest fd_opened=0
+  local answer
 
-  # Prefer to use controlling terminal
   if [[ -r /dev/tty ]]; then
-    # open fd 3 for read/write to /dev/tty
-    exec 3<>/dev/tty
-    fd_opened=1
-    local fd=3
-    # if fd isn't a tty, fall back
-    if ! [[ -t "$fd" ]]; then
-      if [[ $fd_opened -eq 1 ]]; then exec 3<&- 2>/dev/null || true; fi
-      printf "%s\n" "$prompt"
-      echo "Non-interactive terminal: defaulting to 'No'"
-      return 1
-    fi
-
-    # Drain any pending input on the tty (non-blocking) to avoid stray newline
-    # Read small chunks until nothing left
-    while IFS= read -r -t 0 -n 1024 junk <&"$fd" 2>/dev/null; do :; done
-
-    tput civis 2>/dev/null || true
+    # Use /dev/tty directly to avoid stdin confusion
     while true; do
-      printf '\r\033[K' >&"$fd"
-      if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
-      printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >&"$fd"
-
-      # Read one key from fd 3
-      IFS= read -rsn1 -u "$fd" key 2>/dev/null || key=''
-      if [[ $key == $'\x1b' ]]; then
-        # read the rest of escape seq if any (non-blocking short timeout)
-        IFS= read -rsn2 -t 0.05 -u "$fd" rest 2>/dev/null || rest=''
-        key+="$rest"
+      printf "%s [y/N]: " "$prompt" > /dev/tty
+      if ! read -r answer < /dev/tty; then
+        # read failure (EOF, etc) -> treat as No
+        printf "\n" > /dev/tty 2>/dev/null || true
+        return 1
       fi
-
-      case "$key" in
-        $'\n'|$'\r'|'')
-          printf "\n" >&"$fd"
-          tput cnorm 2>/dev/null || true
-          # close fd before return
-          if [[ $fd_opened -eq 1 ]]; then exec 3<&- 2>/dev/null || true; fi
-          [[ $sel -eq 0 ]] && return 0 || return 1
-          ;;
-        $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
-        h|H|l|L) sel=$((1 - sel)) ;;
-        q|Q)
-          printf "\n" >&"$fd"
-          echo -e "${RED}Aborted by user.${RESET}" >&"$fd"
-          tput cnorm 2>/dev/null || true
-          if [[ $fd_opened -eq 1 ]]; then exec 3<&- 2>/dev/null || true; fi
-          exit 1
-          ;;
-        *)
-          # ignore other keys
-          ;;
+      case "${answer,,}" in
+        y|yes) return 0 ;;
+        n|no|"") return 1 ;;
+        *) printf "Please answer 'y' or 'n'.\n" > /dev/tty ;;
       esac
     done
   else
-    # No controlling tty available -> non-interactive environment
-    printf "%s\n" "$prompt"
+    # Non-interactive environment -> default to No
+    echo "$prompt"
     echo "Non-interactive terminal: defaulting to 'No'"
     return 1
   fi
@@ -186,7 +140,7 @@ perform_action(){
   ACTION_CMDS+=("$cmd")
   log_command_to_file_only "INFO" "Planned command" "$cmd"
 
-  # IMPORTANT: In dry-run mode we must NOT prompt. Show what would be done and return.
+  # Crucial: do not prompt in dry-run mode.
   if [[ "${DRY_RUN}" == "true" ]]; then
     printf "%b%s%b\n" "${YELLOW}" "Dry-run: would run command (no changes)" "${RESET}"
     ACTION_RESULTS+=("dry-accepted")
@@ -194,7 +148,7 @@ perform_action(){
     return 0
   fi
 
-  # Normal mode: prompt the user (uses /dev/tty via choose_yes_no)
+  # Normal mode: prompt the user and wait for a full-line answer from /dev/tty
   if choose_yes_no "Apply?"; then
     log_command_to_file_only "INFO" "Executing command" "$cmd"
     if eval "$cmd"; then
@@ -309,15 +263,12 @@ configure_firewall() {
 detect_active_mailserver() {
   MAIL_SERVER_VARIANT=""; MAIL_SERVER_VARIANT_ASSUMED=""; EXIM_VERSION="unknown"
 
-  # Broad cPanel detection; if found, assume Exim (cPanel).
-  # If cPanel markers found but exim binary is not visible, mark as "assumed".
   if [[ -d /usr/local/cpanel ]] || [[ -d /var/cpanel ]] || [[ -f /usr/local/cpanel/version ]] || \
      [[ -f /var/cpanel/exim.conf ]] || [[ -f /var/cpanel/main_exim.conf ]] || \
      [[ -x /usr/local/cpanel/bin/rebuildeximconf ]] || [[ -x /scripts/rebuildeximconf ]]; then
     MAIL_SERVER_VARIANT="cPanel"
     if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
       MAIL_SERVER_VARIANT_ASSUMED=""
-      # capture version
       local ev; ev="$(exim -bV 2>&1 || true)"
       EXIM_VERSION="$(printf '%s\n' "$ev" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
       EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
@@ -329,18 +280,15 @@ detect_active_mailserver() {
     echo "exim"; return 0
   fi
 
-  # If not cPanel, detect exim binary and version
   if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
     local ev; ev="$(exim -bV 2>&1 || true)"
     EXIM_VERSION="$(printf '%s\n' "$ev" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
     EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
     EXIM_VERSION="${EXIM_VERSION:-unknown}"
-    # if output references cPanel, mark variant (not assumed)
     if printf '%s\n' "$ev" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then MAIL_SERVER_VARIANT="cPanel"; MAIL_SERVER_VARIANT_ASSUMED=""; fi
     echo "exim"; return 0
   fi
 
-  # Postfix fallback
   if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
     echo "postfix"; return 0
   fi
