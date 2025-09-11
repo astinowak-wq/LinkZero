@@ -31,10 +31,11 @@ echo -e "  █     █ █   █    █          █      █  █   █ █ █
 echo -e "   █████  █   █    █          █████  █  █   █ █  █"
 echo -e "${NC}"
 
-# We'll print the author line below and animate it if we have a tty.
+# Use this exact line as the animated author text (do NOT create another variable).
 AUTHOR_TEXT=" a u t h o r :    D A N I E L    N O W A K O W S K I"
 
 # Print the author line initially in RED (fallback)
+# Note: we print it normally (with newline) so the layout stays the same.
 echo -e "${RED}${BOLD}${AUTHOR_TEXT}${NC}"
 echo -e "${BLUE}========================================================"
 echo -e "        QHTL Zero Configurator SMTP Hardening    "
@@ -230,7 +231,7 @@ animate_author() {
         # Save cursor, move to absolute pos, print colored author, restore cursor
         printf '\033[s' >"$out" 2>/dev/null || true
         printf '\033[%s;%sH' "$row" "$col" >"$out" 2>/dev/null || true
-        # Use %b to interpret escape sequences for color and bold (don't pass escapes through %s)
+        # Use %b to interpret escape sequences for color and bold; AUTHOR_TEXT is plain text
         printf "%b%s%b" "$color$BOLD" "$AUTHOR_TEXT" "$NC" >"$out" 2>/dev/null || true
         # pad to clear any leftover chars if previous text was longer
         printf "%b" "   " >"$out" 2>/dev/null || true
@@ -240,6 +241,8 @@ animate_author() {
     done
 }
 
+# Start rainbow animation anchored to the already-printed AUTHOR_TEXT line.
+# This function will not create a new author line; it finds the existing one and animates it in-place.
 start_rainbow_author() {
     # Only start if we have a real tty to interact with
     if [[ "$USE_TTY_FD" != true ]]; then
@@ -249,10 +252,19 @@ start_rainbow_author() {
     if [[ -z "$INPUT_FD" || -z "$OUTPUT_PATH" ]]; then
         return 1
     fi
-    # After printing the author line, the cursor is at the end of that line.
-    # Query cursor position to capture the author line location.
+
+    # The AUTHOR_TEXT was printed above with a newline. To get the cursor position
+    # of that printed line we move the terminal cursor up one line, query position,
+    # then move the cursor back down — this avoids creating or printing another author line.
+    printf '\033[1A' >"$OUTPUT_PATH" 2>/dev/null || true   # move up to author line
     local pos
-    pos="$(get_cursor_pos)" || return 1
+    pos="$(get_cursor_pos)" || {
+        # If we can't get cursor pos, restore position and bail out gracefully
+        printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true
+        return 1
+    }
+    printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true   # move back to original spot
+
     AUTHOR_ROW="${pos%;*}"
     AUTHOR_COL="${pos#*;}"
     # Start animator in background, detached from job control
@@ -432,7 +444,7 @@ if [[ "$CAN_MENU" != true ]]; then
     exit 0
 fi
 
-# Start rainbow animation for the author line (only if we have a tty)
+# Start rainbow animation for the already-printed author line (only if we have a tty)
 try_open_tty || true
 start_rainbow_author || true
 
