@@ -105,13 +105,13 @@ perform_backup() {
 }
 
 # interactive yes/no chooser
-# Reworked to use the controlling terminal (/dev/tty or SUDO_TTY) so prompts behave
-# correctly even when stdin/stdout are redirected. Returns 0 for "Yes", 1 for "No".
+# Fixed: read from the controlling terminal (prefer /dev/tty, fall back to $SUDO_TTY)
+# Returns 0 = Yes, 1 = No. In non-interactive environments defaults to No.
 choose_yes_no() {
   local prompt="$1"
   local ttydev=""
 
-  # Prefer /dev/tty; fall back to SUDO_TTY if provided by sudo
+  # Prefer /dev/tty, fall back to SUDO_TTY if set and readable
   if [[ -r /dev/tty ]]; then
     ttydev="/dev/tty"
   elif [[ -n "${SUDO_TTY:-}" && -r "${SUDO_TTY}" ]]; then
@@ -119,20 +119,20 @@ choose_yes_no() {
   fi
 
   if [[ -z "$ttydev" ]]; then
-    # Non-interactive environment: do not prompt; default to "No"
+    # No controlling terminal - be safe and default to "No"
     echo "$prompt"
     echo "Non-interactive terminal: defaulting to 'No'"
     return 1
   fi
 
-  # Open the terminal for reading single-key input on fd 3
+  # Open terminal for reading single-key input on fd 3
   exec 3<"$ttydev" 2>/dev/null || return 1
 
   local sel=0 key rest
   tput civis >/dev/null 2>&1 || true
 
   while true; do
-    # Clear the line and print prompt to the tty
+    # Clear line and print prompt to the controlling terminal
     printf '\r\033[K' >"$ttydev"
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"; option_no="NO"
@@ -141,10 +141,10 @@ choose_yes_no() {
     fi
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >"$ttydev"
 
-    # Read single key (handle escape sequences for arrows)
+    # Read single key (handle escape sequences)
     IFS= read -r -n1 -u 3 key 2>/dev/null || key=''
     if [[ $key == $'\x1b' ]]; then
-      # try to read the rest of the sequence (very short timeout)
+      # try to read remaining bytes of escape sequence with tiny timeout
       IFS= read -r -n2 -t 0.0005 -u 3 rest 2>/dev/null || rest=''
       key+="$rest"
     fi
@@ -156,8 +156,8 @@ choose_yes_no() {
         exec 3<&- 2>/dev/null || true
         [[ $sel -eq 0 ]] && return 0 || return 1
         ;;
+      # Arrow keys toggle selection
       $'\x1b[C'|$'\x1b[D'|$'\x1b[A'|$'\x1b[B')
-        # Left/Right/Up/Down toggle selection
         sel=$((1 - sel))
         ;;
       h|H|l|L)
@@ -171,7 +171,7 @@ choose_yes_no() {
         exit 1
         ;;
       *)
-        # ignore other keys
+        # ignore
         ;;
     esac
   done
@@ -375,7 +375,7 @@ configure_exim(){
     if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
       local ev; ev="$(exim -bV 2>&1 || true)"
       exim_conf="$(printf '%s\n' "$ev" | sed -nE 's/.*Configuration file[^:]*:[[:space:]]*(.+)$/\1/p' | head -n1 || true)"
-      if [[ -z "$exim_conf" && printf '%s\n' "$ev" | grep -qi '/etc/exim4'; then
+      if [[ -z "$exim_conf" ]] && printf '%s\n' "$ev" | grep -qi '/etc/exim4'; then
         if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"; elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
       fi
       exim_conf="$(echo "$exim_conf" | xargs || true)"
