@@ -2,11 +2,11 @@
 #
 # LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# - Uses a dedicated tty fd (fd 3 -> /dev/fd/3) or /dev/tty for prompts to avoid
-#   accidental EOF from stdin terminating the menu loop.
-# - Uninstall removes the installed file without confirmation and RETURNS to the main menu.
-# - Install still performs installation; autostart choices are supported but the installer
-#   is NOT replaced by the launched program (we avoid exec'ing the installed binary).
+# Changes:
+# - dry mode now runs the installed program with --dry-run (does NOT remove the file).
+# - dry-run runs attached to /dev/tty when possible so you can observe program output.
+# - installer process is never replaced by exec; programs are launched in subshells or background.
+# - Uninstall removes the file and returns to the main menu.
 #
 set -euo pipefail
 
@@ -186,7 +186,7 @@ choose_prelaunch_mode() {
     printf " 1) launch     - start program in foreground after countdown\n" >"$OUTPUT_PATH"
     printf " 2) background - start program in background after countdown\n" >"$OUTPUT_PATH"
     printf " 3) none       - do NOT start program after install\n" >"$OUTPUT_PATH"
-    printf " 4) dry        - simulate install (remove installed file) and do NOT launch\n" >"$OUTPUT_PATH"
+    printf " 4) dry        - run installed binary with --dry-run (do NOT start normally)\n" >"$OUTPUT_PATH"
     printf "\n" >"$OUTPUT_PATH"
     read_line choice "Choose [1-4] (default=1): "
     choice="${choice%%[[:space:]]*}"
@@ -214,7 +214,19 @@ countdown_and_apply_mode() {
 
     case "$mode" in
         dry)
-            printf "%b\n" "${YELLOW}Dry-run: simulated install; not launching.${NC}" >"$out"
+            if [[ ! -x "$install_path" ]]; then
+                printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
+                return 0
+            fi
+            printf "%b\n" "${GREEN}Running dry-run: ${install_path} --dry-run${NC}" >"$out"
+            # Run attached to /dev/tty if available so user can see output; do NOT replace installer process.
+            if [[ -w /dev/tty ]]; then
+                # run in subshell attached to tty and wait
+                ( "$install_path" --dry-run </dev/tty >/dev/tty 2>/dev/tty )
+            else
+                # no tty; run detached so installer can continue/exit cleanly
+                nohup "$install_path" --dry-run >/dev/null 2>&1 &
+            fi
             return 0
             ;;
         none)
@@ -227,7 +239,6 @@ countdown_and_apply_mode() {
                 return 0
             fi
             printf "%b\n" "${GREEN}Starting ${install_path} in background${NC}" >"$out"
-            # start detached so installer keeps running
             nohup "$install_path" >/dev/null 2>&1 &
             return 0
             ;;
@@ -237,12 +248,12 @@ countdown_and_apply_mode() {
                 return 0
             fi
             printf "%b\n" "${GREEN}Launching ${install_path} (attached if possible)${NC}" >"$out"
-            # Try to run attached to /dev/tty in a subshell so we don't replace the installer process.
             if [[ -w /dev/tty ]]; then
                 ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty ) &
             else
                 nohup "$install_path" >/dev/null 2>&1 &
             fi
+            return 0
             ;;
         *)
             printf "%b\n" "${YELLOW}Unknown mode: %s${NC}" "$mode" >"$out"
@@ -271,9 +282,7 @@ install_action() {
     try_open_tty || true
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
-    if [[ "$chosen_mode" == "dry" ]]; then
-        rm -f "$install_path" || true
-    fi
+    # For dry mode we DO NOT remove the installed file; countdown_and_apply_mode will run --dry-run.
     countdown_and_apply_mode "$install_path" "$chosen_mode"
 
     # After install we will exit the installer (preserve original behavior)
