@@ -4,16 +4,12 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Behavior:
-# - Detects the active firewall manager (nftables > csf > firewalld > iptables)
-#   and only presents/actions for the detected manager.
-# - Interactive Yes/No chooser: options are rendered in white by default.
-#   While navigating, the currently-selected option will change color:
-#     - YES becomes green when selected
-#     - NO becomes red when selected
-#   The option labels are not rendered in bold (so the menu stays visible).
-# - --dry-run prevents any commands from actually running; accepted actions are
-#   recorded as "would run".
+# Changes in this revision:
+# - Fix visibility of the interactive chooser: unselected answers are rendered
+#   in the terminal default color (no explicit "white" color sequence) so they
+#   aren't invisible on white/bright backgrounds. The currently-selected
+#   option is rendered in color (green for YES, red for NO) while you move
+#   the arrows. Options remain non-bold per your earlier request.
 #
 set -euo pipefail
 
@@ -28,7 +24,6 @@ if [[ -t 1 ]]; then
   BLUE='\033[0;34m'
   MAGENTA='\033[0;35m'
   CYAN='\033[0;36m'
-  WHITE='\033[0;37m'
   BOLD='\033[1m'
   RESET='\033[0m'
 else
@@ -38,7 +33,6 @@ else
   BLUE=''
   MAGENTA=''
   CYAN=''
-  WHITE=''
   BOLD=''
   RESET=''
 fi
@@ -132,15 +126,16 @@ choose_yes_no() {
   tput civis 2>/dev/null || true
 
   while true; do
-    # clear line and render prompt with colored options (selected option colored)
+    # clear line and render prompt with colored selected option
     printf '\r\033[K'
 
-    # When selected: YES -> green, NO -> red. Unselected option stays white.
+    # IMPORTANT: unselected option uses the terminal default color (no explicit white),
+    # selected option uses green (YES) or red (NO) so it's visible on any background.
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"
-      option_no="${WHITE}NO${RESET}"
+      option_no="NO"
     else
-      option_yes="${WHITE}YES${RESET}"
+      option_yes="YES"
       option_no="${RED}NO${RESET}"
     fi
 
