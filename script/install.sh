@@ -2,7 +2,9 @@
 #
 # LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# Update: removed all countdowns — actions (launch / dry / none) occur immediately.
+# Update: when the program is already installed, the main menu gains a
+# "Run LinkZero" option so the user can run the preinstalled program
+# directly from the installer. Running returns to the menu afterwards.
 #
 set -euo pipefail
 
@@ -126,30 +128,8 @@ read_line() {
     printf -v "$__var" "%s" "$line"
 }
 
-# parse args
-for arg in "$@"; do
-    case "$arg" in
-        --install|-i) ACTION="install" ;;
-        --uninstall|-u) ACTION="uninstall" ;;
-        --yes|-y) YES=true ;;
-        --force|-f) FORCE=true ;;
-        --interactive) FORCE_MENU=true ;;
-        -h|--help) printf "Usage: %s [--install|--uninstall] [--yes] [--interactive]\n" "$0"; exit 0 ;;
-        *) ;;
-    esac
-done
-
-# DEBUG info helper
-debug_dump() {
-    if [[ -n "$DEBUG" ]]; then
-        printf "DEBUG: -t0=%s -t1=%s SUDO_TTY=%s USE_TTY_FD=%s NONINTERACTIVE=%s CI=%s\n" \
-            "$( [[ -t 0 ]] && echo true || echo false )" \
-            "$( [[ -t 1 ]] && echo true || echo false )" \
-            "${SUDO_TTY:-}" \
-            "$USE_TTY_FD" \
-            "${NONINTERACTIVE:-}" \
-            "${CI:-}"
-    fi
+is_installed() {
+    [[ -x "${INSTALL_DIR}/${SCRIPT_NAME}" ]]
 }
 
 ensure_install_dir() {
@@ -193,10 +173,6 @@ choose_prelaunch_mode() {
 }
 
 # Apply selected mode immediately (no countdown)
-# modes:
-#  - dry  -> run installed binary with --dry-run (attached to /dev/tty if possible)
-#  - none -> do nothing, return to caller immediately
-#  - launch-> start installed binary (attached if possible) and then exit installer
 countdown_and_apply_mode() {
     local install_path="$1"
     local mode="$2"
@@ -220,6 +196,7 @@ countdown_and_apply_mode() {
             else
                 # no tty; run detached so installer can continue/exit cleanly
                 nohup "$install_path" --dry-run >/dev/null 2>&1 &
+                printf "%b\n" "${GREEN}Dry-run started in background (nohup).${NC}" >"$out"
             fi
             return 0
             ;;
@@ -231,8 +208,10 @@ countdown_and_apply_mode() {
             printf "%b\n" "${GREEN}Launching ${install_path} (attached if possible)${NC}" >"$out"
             if [[ -w /dev/tty ]]; then
                 ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty ) &
+                printf "%b\n" "${GREEN}Launched (attached subshell).${NC}" >"$out"
             else
                 nohup "$install_path" >/dev/null 2>&1 &
+                printf "%b\n" "${GREEN}Launched in background (nohup).${NC}" >"$out"
             fi
             return 0
             ;;
@@ -277,6 +256,29 @@ install_action() {
     exit 0
 }
 
+run_installed_action() {
+    local install_path="$INSTALL_DIR/$SCRIPT_NAME"
+    open_io
+    local out="$OUTPUT_PATH"
+
+    if [[ ! -x "$install_path" ]]; then
+        printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
+        return 0
+    fi
+
+    printf "%b\n" "${GREEN}Running installed program: ${install_path}${NC}" >"$out"
+    if [[ -w /dev/tty ]]; then
+        # run attached to tty and wait; subshell so installer is not replaced
+        ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty )
+        printf "%b\n" "${GREEN}Program exited; returning to installer menu.${NC}" >"$out"
+    else
+        # no tty; run detached and return immediately
+        nohup "$install_path" >/dev/null 2>&1 &
+        printf "%b\n" "${GREEN}Program started in background (nohup).${NC}" >"$out"
+    fi
+    return 0
+}
+
 uninstall_action() {
     local install_path="$INSTALL_DIR/$SCRIPT_NAME"
     if [[ ! -f "$install_path" ]]; then
@@ -317,15 +319,38 @@ if [[ "$CAN_MENU" != true ]]; then
     exit 0
 fi
 
-# Numeric-style interactive main menu loop
-options=("Install LinkZero" "Uninstall LinkZero" "Exit")
-
+# Numeric-style interactive main menu loop (dynamic options when installed)
 while true; do
-    # Determine default based on presence of installed file
-    if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
-        default_choice=2
+    # build menu dynamically
+    declare -a MENU_TEXT=()
+    declare -a MENU_ACTION=()
+
+    MENU_TEXT+=("Install LinkZero")
+    MENU_ACTION+=("install")
+
+    if is_installed; then
+        MENU_TEXT+=("Run LinkZero")
+        MENU_ACTION+=("run")
+    fi
+
+    MENU_TEXT+=("Uninstall LinkZero")
+    MENU_ACTION+=("uninstall")
+
+    MENU_TEXT+=("Exit")
+    MENU_ACTION+=("exit")
+
+    # choose default: prefer "run" if installed, otherwise "install"
+    default_choice_index=1
+    if is_installed; then
+        # find index of "run" (1-based)
+        for idx in "${!MENU_ACTION[@]}"; do
+            if [[ "${MENU_ACTION[$idx]}" == "run" ]]; then
+                default_choice_index=$((idx+1))
+                break
+            fi
+        done
     else
-        default_choice=1
+        default_choice_index=1
     fi
 
     try_open_tty || true
@@ -333,36 +358,54 @@ while true; do
 
     printf "\n" >"$OUTPUT_PATH"
     printf "Use numeric menu to choose an action:\n" >"$OUTPUT_PATH"
-    for i in "${!options[@]}"; do
-        printf "  %d) %s\n" $((i+1)) "${options[$i]}" >"$OUTPUT_PATH"
+    for i in "${!MENU_TEXT[@]}"; do
+        printf "  %d) %s\n" $((i+1)) "${MENU_TEXT[$i]}" >"$OUTPUT_PATH"
     done
 
     # Prompt for selection
-    read_line selection "Choose [1-3] (default=${default_choice}): "
+    read_line selection "Choose [1-${#MENU_TEXT[@]}] (default=${default_choice_index}): "
     selection="${selection%%[[:space:]]*}"
 
     if [[ -z "$selection" ]]; then
-        selection="$default_choice"
+        selection="${default_choice_index}"
     fi
 
-    case "$selection" in
-        1)
+    # validate numeric
+    if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+        warn "Invalid selection; try again." >"$OUTPUT_PATH"
+        continue
+    fi
+
+    if (( selection < 1 || selection > ${#MENU_ACTION[@]} )); then
+        warn "Invalid selection; try again." >"$OUTPUT_PATH"
+        continue
+    fi
+
+    chosen_action="${MENU_ACTION[$((selection-1))]}"
+
+    case "$chosen_action" in
+        install)
             install_action
-            # If install_action returns (chosen_mode == none), loop will continue; otherwise install_action exits.
+            # if install_action returns (user chose "none"), loop continues; otherwise install_action exits.
             continue
             ;;
-        2)
+        run)
+            run_installed_action
+            # after run, return to menu
+            continue
+            ;;
+        uninstall)
             uninstall_action
-            # After uninstall, show status then loop back so user can choose again
+            # after uninstall, return to menu
             continue
             ;;
-        3|q|Q)
+        exit)
             echo "Exit." >"$OUTPUT_PATH"
             exec 3<&- 2>/dev/null || true
             exit 0
             ;;
         *)
-            warn "Invalid selection; try again."
+            warn "Unhandled action; try again." >"$OUTPUT_PATH"
             continue
             ;;
     esac
