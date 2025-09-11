@@ -25,9 +25,9 @@ echo -e "   █████  █   █  █████        █      █     
 echo -e "  █     █ █   █    █          █               █  █"
 echo -e "  █     █ █   █    █          █      █  █     █ █ "
 echo -e "  █     █ █████    █          █      █  ████  ██  "
-echo -e "  █   █ █ █   █    █          █      █  █   █ █ █ "
+echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
 echo -e "   █████  █   █    █          █████  █  █   █ █  █"
-echo -e "        █${NC}"
+echo -e "${NC}"
 echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
 echo -e "${BLUE}========================================================"
 echo -e "        QHTL Zero Configurator SMTP Hardening    "
@@ -126,6 +126,126 @@ read_line() {
     printf -v "$__var" "%s" "$line"
 }
 
+# New: interactive menu selector that understands arrow keys and cycles between choices.
+# It prints the prompt to OUTPUT_PATH and reads single-key input from fd 3 (if available)
+# or from INPUT_FD. Up/Down arrows cycle, Enter confirms, digits 1-3 select directly.
+# Returns the chosen value in the global variable 'selection'.
+menu_select_with_arrows() {
+    local default="$1"   # default choice number (1..3)
+    local prompt="Choose [1-3] (default=${default}): "
+    # ensure IO paths
+    open_io
+
+    # If no interactive input available, fall back to line-based read
+    if [[ -z "$INPUT_FD" ]]; then
+        read_line selection "$prompt"
+        selection="${selection%%[[:space:]]*}"
+        if [[ -z "$selection" ]]; then
+            selection="$default"
+        fi
+        return 0
+    fi
+
+    # initial selection
+    local sel="$default"
+    # Print prompt and initial selection
+    printf "%s" "$prompt" >"$OUTPUT_PATH"
+    printf "%s" "$sel" >"$OUTPUT_PATH"
+    # We will update the number in-place. Keep track of prompt length to overwrite correctly.
+    local prompt_len=${#prompt}
+
+    # helper to redraw prompt+selection (keeps cursor at end)
+    _redraw() {
+        # carriage return and reprint prompt and current selection
+        printf '\r' >"$OUTPUT_PATH"
+        printf "%s" "$prompt" >"$OUTPUT_PATH"
+        printf "%s" "$sel" >"$OUTPUT_PATH"
+        # clear any leftover characters (if previous had more digits, not likely here but safe)
+        printf ' ' >"$OUTPUT_PATH"
+    }
+
+    # Read keys loop
+    while true; do
+        local c="" c2="" c3=""
+        if [[ "$USE_TTY_FD" == true ]]; then
+            # read one byte from fd 3
+            IFS= read -r -n1 -u 3 c 2>/dev/null || c=""
+        else
+            IFS= read -r -n1 c <"$INPUT_FD" 2>/dev/null || c=""
+        fi
+
+        # if nothing read (EOF), break and use default
+        if [[ -z "$c" ]]; then
+            sel="$default"
+            break
+        fi
+
+        # handle escape sequences (arrow keys)
+        if [[ "$c" == $'\x1b' ]]; then
+            # read the next two bytes if present
+            if [[ "$USE_TTY_FD" == true ]]; then
+                IFS= read -r -n1 -u 3 c2 2>/dev/null || c2=""
+                IFS= read -r -n1 -u 3 c3 2>/dev/null || c3=""
+            else
+                IFS= read -r -n1 c2 <"$INPUT_FD" 2>/dev/null || c2=""
+                IFS= read -r -n1 c3 <"$INPUT_FD" 2>/dev/null || c3=""
+            fi
+            # typical arrow sequence is ESC [ A/B (c2='[' c3='A'/'B')
+            if [[ "$c3" == "A" ]]; then
+                # Up: move selection up (1 <- 3 wrap)
+                if [[ "$sel" -le 1 ]]; then
+                    sel=3
+                else
+                    sel=$((sel-1))
+                fi
+                _redraw
+                continue
+            elif [[ "$c3" == "B" ]]; then
+                # Down: move selection down (3 -> 1 wrap)
+                if [[ "$sel" -ge 3 ]]; then
+                    sel=1
+                else
+                    sel=$((sel+1))
+                fi
+                _redraw
+                continue
+            else
+                # ignore other escape sequences
+                continue
+            fi
+        fi
+
+        # handle single-byte inputs
+        case "$c" in
+            $'\n'|$'\r')
+                # Enter confirms the current selection
+                break
+                ;;
+            1|2|3)
+                sel="$c"
+                # echo selected digit and break
+                # overwrite displayed selection so user sees it before newline
+                _redraw
+                break
+                ;;
+            q|Q)
+                sel="q"
+                break
+                ;;
+            *)
+                # ignore other characters but keep the prompt visible
+                _redraw
+                continue
+                ;;
+        esac
+    done
+
+    # finish line visually
+    printf "\n" >"$OUTPUT_PATH"
+    selection="$sel"
+    return 0
+}
+
 # parse args
 for arg in "$@"; do
     case "$arg" in
@@ -183,9 +303,10 @@ choose_prelaunch_mode() {
     printf " 2) dry        - run installed binary with --dry-run (do NOT start normally)\n" >"$OUTPUT_PATH"
     printf " 3) none       - do NOT start program after install (return to main menu)\n" >"$OUTPUT_PATH"
     printf "\n" >"$OUTPUT_PATH"
-    read_line choice "Choose [1-3] (default=1): "
-    choice="${choice%%[[:space:]]*}"
-    case "$choice" in
+
+    # Use arrow-aware selector here as well for a better interactive experience.
+    menu_select_with_arrows 1
+    case "${selection}" in
         2) printf "dry" ;;
         3) printf "none" ;;
         *) printf "launch" ;;
@@ -337,8 +458,9 @@ while true; do
         printf "  %d) %s\n" $((i+1)) "${options[$i]}" >"$OUTPUT_PATH"
     done
 
-    # Prompt for selection
-    read_line selection "Choose [1-3] (default=${default_choice}): "
+    # Use the arrow-aware menu selector here. It will set the global 'selection'.
+    menu_select_with_arrows "$default_choice"
+
     selection="${selection%%[[:space:]]*}"
 
     if [[ -z "$selection" ]]; then
