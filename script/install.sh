@@ -108,6 +108,17 @@ read_key() {
             key=''
         fi
     fi
+
+    # If we didn't get anything, try one last time reading directly from /dev/tty
+    # This helps environments where fd3 may be closed or stdin is not the input device
+    # that actually receives key presses (some sudo/piped terminals).
+    if [[ -z "$key" && -r /dev/tty ]]; then
+        IFS= read -rsn1 key </dev/tty 2>/dev/null || key=''
+        if [[ $key == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || rest=''
+            key+="$rest"
+        fi
+    fi
 }
 
 # parse args
@@ -281,7 +292,19 @@ redraw_menu
 while true; do
     read_key
 
-    # if read_key produced empty key, bail to non-interactive
+    # if read_key produced empty key, try one more targeted read from /dev/tty before bailing
+    if [[ -z "$key" ]]; then
+        # attempt once more (blocking) from /dev/tty
+        if [[ -r /dev/tty ]]; then
+            IFS= read -rsn1 key </dev/tty 2>/dev/null || key=''
+            if [[ $key == $'\x1b' ]]; then
+                IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || rest=''
+                key+="$rest"
+            fi
+        fi
+    fi
+
+    # if still empty, bail to non-interactive
     if [[ -z "$key" ]]; then
         warn "No interactive input read; falling back to non-interactive install."
         tput cnorm 2>/dev/null || true
