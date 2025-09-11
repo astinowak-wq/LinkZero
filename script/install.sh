@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 #
 # LinkZero installer — numbered interactive menu with configurable autostart mode
-# Supported autostart modes:
-#   launch     - start installed program in foreground after countdown (default)
-#   background - start installed program in background after countdown
-#   none       - do NOT start program after install
-#   dry        - simulate install; do not write the installed file
+# Adds a short interactive menu that appears just before autostart so the user can
+# choose the mode that will be applied immediately (and launched 5 seconds later).
 #
 set -euo pipefail
 
@@ -163,11 +160,50 @@ countdown_and_launch() {
     esac
 }
 
+# This presents a small numbered menu right before autostart.
+# It returns the selected mode string on stdout: launch|background|none|dry
+choose_autostart_for_run() {
+    local default_mode="${1:-$(read_autostart_mode)}"
+    # If no interactive terminal, return the default immediately
+    if [[ ! -r /dev/tty && ! -t 1 ]]; then
+        printf "%s" "$default_mode"
+        return 0
+    fi
+
+    # Show the menu on the controlling terminal so piped sudo runs see it
+    local out="/dev/tty"
+    printf "\n" >"$out"
+    printf "%b\n" "${ORANGE}Choose autostart mode for this run (the chosen mode will start 5 seconds after selection):${NC}" >"$out"
+    printf "Current default: %s\n" "$default_mode" >"$out"
+    printf " 1) launch     - start program in foreground after countdown\n" >"$out"
+    printf " 2) background - start program in background after countdown\n" >"$out"
+    printf " 3) none       - do NOT start program after install\n" >"$out"
+    printf " 4) dry        - simulate install; do not write file nor launch\n" >"$out"
+    printf "\n" >"$out"
+    printf "Press Enter to use default (%s).\n" "$default_mode" >"$out"
+
+    local choice=""
+    read -r -p "Choose [1-4]: " choice </dev/tty || choice=""
+
+    if [[ -z "$choice" ]]; then
+        printf "%s" "$default_mode"
+        return 0
+    fi
+
+    case "$choice" in
+        1) printf "launch" ;;
+        2) printf "background" ;;
+        3) printf "none" ;;
+        4) printf "dry" ;;
+        *) printf "%s" "$default_mode" ;;
+    esac
+}
+
 # install_action supports an optional mode parameter. 'dry' doesn't write the installed file.
 install_action(){
-    local mode="${1:-$(read_autostart_mode)}"
+    local cfg_mode="${1:-$(read_autostart_mode)}"
 
-    log "Installing LinkZero... (autostart mode: $mode)"
+    log "Installing LinkZero... (configured autostart mode: $cfg_mode)"
     ensure_install_dir
     TMP_DL="$(mktemp /tmp/linkzero-XXXXXX.sh)"
     trap 'rm -f "${TMP_DL}"' EXIT
@@ -180,10 +216,18 @@ install_action(){
 
     install_path="$INSTALL_DIR/$SCRIPT_NAME"
 
-    if [[ "$mode" == "dry" ]]; then
+    # If interactive terminal is present, allow the user to choose the autostart mode
+    # that will be applied immediately (and started 5 seconds after selection).
+    local run_mode="$cfg_mode"
+    if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
+        run_mode="$(choose_autostart_for_run "$cfg_mode")"
+    fi
+
+    if [[ "$run_mode" == "dry" ]]; then
         printf "%b\n" "${ORANGE}Dry-run: would install $TMP_DL -> $install_path${NC}"
         rm -f "$TMP_DL"
-        countdown_and_launch "$install_path" "$mode" 5
+        # Show the 5-second countdown and do NOT launch (dry)
+        countdown_and_launch "$install_path" "$run_mode" 5
         return 0
     fi
 
@@ -191,7 +235,8 @@ install_action(){
     chmod +x "$install_path"
     log "Installed to $install_path"
 
-    countdown_and_launch "$install_path" "$mode" 5
+    # Immediately after install, show the orange countdown and start according to run_mode.
+    countdown_and_launch "$install_path" "$run_mode" 5
 }
 
 # Uninstall: no prompt — remove known files/directories immediately.
