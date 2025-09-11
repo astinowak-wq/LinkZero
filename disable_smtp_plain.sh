@@ -29,6 +29,28 @@ else
   RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; RESET=''
 fi
 
+# Clear the terminal screen
+clear
+
+# Big pixel-art QHTL logo (with double space between T and L)
+echo -e "${GREEN}"
+echo -e "   █████  █   █  █████        █      █        █   "
+echo -e "  █     █ █   █    █          █               █  █"
+echo -e "  █     █ █   █    █          █      █  █     █ █ "
+echo -e "  █     █ █████    █          █      █  ████  ██  "
+echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
+echo -e "   █████  █   █    █          █████  █  █   █ █  █"
+echo -e "${NC}"
+
+# Red bold capital Daniel Nowakowski below logo
+echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+
+# Display QHTL Zero header
+echo -e "${BLUE}========================================================"
+echo -e "        QHTL Zero Configurator Roundcube on Cpanel"
+echo -e "========================================================${NC}"
+echo -e ""
+
 declare -a ACTION_DESCS
 declare -a ACTION_CMDS
 declare -a ACTION_RESULTS
