@@ -5,13 +5,13 @@
 # --dry-run mode that produces no side effects on the running system.
 #
 # Revision notes (this change):
-# - Added mail-server detection with priority: exim > postfix > none.
-# - If exim is detected, only Exim-related actions are offered/executed.
-# - If postfix is detected (and exim is not), only Postfix-related actions are offered/executed.
-# - If neither is detected, the script falls back to prompting for both (the "rest" case).
-# - Ensured Exim checks are not duplicated; there is a single configure_exim() and single
-#   detection point. All audit logging still records full commands to the logfile only;
-#   the interactive terminal never shows command text.
+# - When Exim config isn't found at the usual places, check for cPanel-specific
+#   locations and detect a cPanel Exim installation.
+# - If a cPanel Exim config is found, the script reports that "Exim (cPanel)"
+#   is detected and uses that config path for backup/editing. The message is a
+#   normal informational line (no command text printed).
+# - Full commands remain logged to the logfile only; terminal never shows
+#   full command texts (audit trail preserved).
 #
 set -euo pipefail
 
@@ -156,7 +156,7 @@ detect_active_firewall() {
   return 0
 }
 
-# Firewall existence checks (unchanged behaviour from earlier revision)
+# Firewall existence checks
 firewall_change_exists() {
   local manager="$1"; shift
   local cmd="$*"
@@ -257,7 +257,7 @@ firewall_change_exists() {
   return 1
 }
 
-# Terminal arrow-based chooser (unchanged)
+# Terminal arrow-based chooser
 choose_yes_no() {
   local prompt="$1"
 
@@ -313,7 +313,7 @@ choose_yes_no() {
   done
 }
 
-# perform_action unchanged in behaviour: user sees only action + result; commands logged to logfile-only
+# perform_action: user sees only the Action and the result; full commands are logged only
 perform_action(){
   local desc="$1"; shift
   local cmd="$*"
@@ -323,7 +323,7 @@ perform_action(){
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
 
-  # record planned command to logfile only
+  # record planned command to logfile only (do not print to terminal)
   log_command_to_file_only "INFO" "Planned command for action" "$cmd"
 
   if choose_yes_no "Apply?"; then
@@ -334,7 +334,6 @@ perform_action(){
       return 0
     fi
 
-    # Record execution attempt to logfile only (no command printed to terminal)
     log_command_to_file_only "INFO" "Executing command for action" "$cmd"
     if eval "$cmd"; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
@@ -355,7 +354,7 @@ perform_action(){
   fi
 }
 
-# Wrapper that checks firewall changes (unchanged from previous revision)
+# Wrapper that checks firewall changes
 precheck_and_perform_firewall_action() {
   local manager="$1"; shift
   local desc="$1"; shift
@@ -373,7 +372,7 @@ precheck_and_perform_firewall_action() {
   perform_action "$desc" "$cmd"
 }
 
-# Configure firewall (unchanged)
+# Configure firewall
 configure_firewall() {
   local fw
   fw="$(detect_active_firewall)"
@@ -424,31 +423,25 @@ nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/de
 # MAIL SERVER DETECTION
 # Priority: exim > postfix > none
 detect_active_mailserver() {
-  # Exim (exim or exim4)
   if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
     echo "exim"
     return 0
   fi
-
-  # Postfix (prefer checking postconf or systemctl status)
   if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
-    # optionally check systemctl status of postfix if available
     if command -v systemctl >/dev/null 2>&1; then
       if systemctl is-active --quiet postfix 2>/dev/null; then
         echo "postfix"
         return 0
       fi
     fi
-    # If postconf or postfix present, treat as postfix
     echo "postfix"
     return 0
   fi
-
   echo "none"
   return 0
 }
 
-# Configure Postfix: only executed when selected by detection (or in fallback 'none' case)
+# Configure Postfix
 configure_postfix(){
   log_info "Configuring Postfix to require TLS for AUTH"
 
@@ -468,8 +461,8 @@ configure_postfix(){
   fi
 }
 
-# Configure Exim: only executed when selected by detection (or in fallback 'none' case)
-# Single canonical configure_exim() - no duplicate Exim checks elsewhere.
+# Configure Exim
+# Single canonical configure_exim() - checks standard locations first, then cPanel locations.
 configure_exim(){
   log_info "Configuring Exim to require TLS for AUTH (if Exim is present)"
 
@@ -479,10 +472,54 @@ configure_exim(){
   fi
 
   local exim_conf=""
+  # Common Debian/Ubuntu exim config
   if [[ -f /etc/exim4/exim4.conf.template ]]; then
     exim_conf="/etc/exim4/exim4.conf.template"
+  # Standard location
   elif [[ -f /etc/exim/exim.conf ]]; then
     exim_conf="/etc/exim/exim.conf"
+  elif [[ -f /etc/exim.conf ]]; then
+    exim_conf="/etc/exim.conf"
+  fi
+
+  # If not found, check common cPanel locations and heuristics
+  if [[ -z "$exim_conf" ]]; then
+    if [[ -d /usr/local/cpanel ]] || [[ -d /var/cpanel ]]; then
+      # Try common cPanel-managed exim locations
+      local candidates=(
+        "/var/cpanel/exim.conf"
+        "/var/cpanel/main_exim.conf"
+        "/var/cpanel/exim.conf.local"
+        "/etc/exim.conf"
+        "/etc/exim.conf.local"
+        "/var/cpanel/userdata/*/exim.conf"
+      )
+      for p in "${candidates[@]}"; do
+        # Use globbing for wildcard candidates
+        for f in $p; do
+          if [[ -f "$f" ]]; then
+            exim_conf="$f"
+            break 2
+          fi
+        done
+      done
+
+      # As a last resort within cPanel environment, attempt a shallow find (best-effort)
+      if [[ -z "$exim_conf" ]]; then
+        # limit depth to avoid long searches
+        local found
+        found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
+        if [[ -n "$found" ]]; then
+          exim_conf="$found"
+        fi
+      fi
+
+      if [[ -n "$exim_conf" ]]; then
+        log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"
+      else
+        log_info "cPanel detected but Exim config file not found in common cPanel locations"
+      fi
+    fi
   fi
 
   if [[ -n "$exim_conf" ]]; then
@@ -494,7 +531,8 @@ configure_exim(){
     perform_action "Backup Exim config file" "$backup_cmd"
     perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim config" "$sed_cmd"
   else
-    log_info "Exim configuration file not found at standard locations"
+    log_info "Exim configuration file not found at standard or cPanel locations; skipping Exim config edits"
+    return 0
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
@@ -507,9 +545,13 @@ configure_exim(){
 # Test configuration: only test the active mail server(s) as appropriate
 test_configuration(){
   log_info "Testing mail server configuration (these actions will be prompted separately)"
-  # Basic checks left as perform_action so user can accept or reject
-  perform_action "Postfix: basic configuration check" "postfix check"
-  perform_action "Exim: basic configuration info" "exim -bV"
+  # Basic checks; the configure_exim() function determines whether exim is present
+  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then
+    perform_action "Postfix: basic configuration check" "postfix check"
+  fi
+  if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
+    perform_action "Exim: basic configuration info" "exim -bV"
+  fi
 }
 
 _print_summary(){
@@ -565,7 +607,7 @@ main(){
     exim)
       log_info "Exim detected: only running Exim-related configuration and checks."
       configure_exim
-      test_configuration   # test_configuration will prompt for both checks, but configure_exim already ensured exim presence
+      test_configuration
       ;;
     postfix)
       log_info "Postfix detected (no Exim): only running Postfix-related configuration and checks."
