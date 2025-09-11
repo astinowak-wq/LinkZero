@@ -1,32 +1,18 @@
 #!/usr/bin/env bash
 #
-# disable_smtp_plain.sh
+# linkzero-smtp (formerly disable_smtp_plain.sh)
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Display change in this revision:
-# - The "[INFO] Detected mail server" line now prints the service with:
-#     CapitalizedName (version) (assumed cPanel)
-#   Examples:
-#     [INFO] Detected mail server: Exim (4.94) (assumed cPanel)
-#     [INFO] Detected mail server: Exim (4.94) (cPanel)
-#     [INFO] Detected mail server: Postfix
-#
-# Other behavior: backups are non-interactive and use .link0; commands logged
-# to LOG_FILE only. Edits/restarts remain interactive.
-#
 set -euo pipefail
 
-# Colors (fallback) - ensure defined before any logging when set -u is used
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Colors (fallback)
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 LOG_FILE="/var/log/linkzero-smtp-security.log"
 DRY_RUN="${DRY_RUN:-false}"
 
-# Colors only when stdout is a terminal
+# Enable colors only when stdout is a terminal
 if [[ -t 1 ]]; then
   RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
   BLUE=$'\033[0;34m'; MAGENTA=$'\033[0;35m'; CYAN=$'\033[0;36m'
@@ -35,15 +21,11 @@ else
   RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; RESET=''
 fi
 
-declare -a ACTION_DESCS
-declare -a ACTION_CMDS
-declare -a ACTION_RESULTS
-
+declare -a ACTION_DESCS ACTION_CMDS ACTION_RESULTS
 MAIL_SERVER_VARIANT=""
 MAIL_SERVER_VARIANT_ASSUMED=""  # "assumed" when variant inferred from cPanel markers only
 EXIM_VERSION="unknown"
 
-# hide timestamp-prefixed lines on terminal
 filter_out_timestamp_lines() {
   local re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
   while IFS= read -r line; do
@@ -64,16 +46,23 @@ log() {
   local msg="$*"
   log_to_file "$level" "$msg"
   if [[ "${DRY_RUN}" == "true" ]]; then
-    if [[ -t 1 ]]; then printf '[%s] %s\n' "$level" "$msg"; else printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"; fi
+    if [[ -t 1 ]]; then
+      printf '[%s] %s\n' "$level" "$msg"
+    else
+      printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"
+    fi
   else
-    if [[ -t 1 ]]; then printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines; else printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"; fi
+    if [[ -t 1 ]]; then
+      printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
+    else
+      printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg"
+    fi
   fi
 }
 log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
-# write full command to logfile only
 log_command_to_file_only() {
   local level="$1"; shift
   local msg="$1"; shift
@@ -81,7 +70,6 @@ log_command_to_file_only() {
   log_to_file "$level" "$msg: $cmd"
 }
 
-# non-interactive backup (no "Action:" prompt). Respects DRY_RUN.
 perform_backup() {
   local desc="$1"; shift
   local cmd="$*"
@@ -104,10 +92,13 @@ perform_backup() {
   fi
 }
 
-# interactive yes/no chooser
 choose_yes_no() {
   local prompt="$1"
-  if ! [[ -t 0 ]]; then echo "$prompt"; echo "Non-interactive terminal: defaulting to 'No'"; return 1; fi
+  if ! [[ -t 0 ]]; then
+    echo "$prompt"
+    echo "Non-interactive terminal: defaulting to 'No'"
+    return 1
+  fi
   local sel=0 key
   tput civis 2>/dev/null || true
   while true; do
@@ -139,15 +130,19 @@ perform_action(){
       ACTION_RESULTS+=("dry-accepted"); log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"; return 0
     fi
     log_command_to_file_only "INFO" "Executing command" "$cmd"
-    if eval "$cmd"; then printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"; log_success "$desc"; ACTION_RESULTS+=("executed"); return 0
-    else printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"; log_error "$desc failed"; ACTION_RESULTS+=("failed"); return 1; fi
+    if eval "$cmd"; then
+      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
+      log_success "$desc"; ACTION_RESULTS+=("executed"); return 0
+    else
+      printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"
+      log_error "$desc failed"; ACTION_RESULTS+=("failed"); return 1
+    fi
   else
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped"); log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"; return 0
   fi
 }
 
-# firewall detection helpers (kept minimal)
 csf_present() {
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet csf 2>/dev/null || systemctl is-active --quiet lfd 2>/dev/null; then return 0; fi
@@ -158,7 +153,9 @@ csf_present() {
 }
 detect_active_firewall() {
   if csf_present; then echo "csf"; return 0; fi
-  if command -v nft >/dev/null 2>&1; then if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi; fi
+  if command -v nft >/dev/null 2>&1; then
+    if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi
+  fi
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then echo "firewalld"; return 0; fi
     if systemctl is-active --quiet firewalld 2>/dev/null; then echo "firewalld"; return 0; fi
@@ -167,7 +164,6 @@ detect_active_firewall() {
   echo "none"; return 0
 }
 
-# simple extraction check for firewall changes (kept compact)
 firewall_change_exists() {
   local manager="$1"; shift
   local cmd="$*"
@@ -177,13 +173,21 @@ firewall_change_exists() {
     case "$manager" in
       nftables) nft list ruleset 2>/dev/null | grep -E -q "dport[[:space:]]+$port" && return 0 ;;
       firewalld) firewall-cmd --permanent --list-ports 2>/dev/null | tr ' ' '\n' | grep -xq "${port}/tcp" && return 0 ;;
-      iptables) if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 && return 0; fi ;;
+      iptables)
+        if command -v iptables >/dev/null 2>&1; then
+          iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 && return 0 || true
+        fi
+        ;;
       csf)
         if [[ -r /etc/csf/csf.conf ]]; then
-          local line; line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 || true)"
+          local line
+          line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 || true)"
           line="${line#*=}"; line="${line//\"/}"; line="${line//\'/}"; line="${line// /}"
-          for p in 25 465 587; do grep -q "^$p\$" <<<"${line//,/\\n}" && return 0 || true; done
-        fi ;;
+          for p in 25 465 587; do
+            grep -q "^$p\$" <<<"${line//,/\\n}" && return 0 || true
+          done
+        fi
+        ;;
     esac
   done
   return 1
@@ -195,60 +199,22 @@ precheck_and_perform_firewall_action() {
   local cmd="$*"
   if firewall_change_exists "$manager" "$cmd"; then
     printf "%b%s%b\n" "${BLUE}" "Firewall changes aren't necessary — already present" "${RESET}"
-    ACTION_DESCS+=("$desc"); ACTION_CMDS+=("$cmd"); ACTION_RESULTS+=("already"); log_info "Skipped firewall action (already present): $desc"; return 0
+    ACTION_DESCS+=("$desc"); ACTION_CMDS+=("$cmd"); ACTION_RESULTS+=("already")
+    log_info "Skipped firewall action (already present): $desc"
+    return 0
   fi
   perform_action "$desc" "$cmd"
 }
 
-configure_firewall() {
-  local fw; fw="$(detect_active_firewall)"; log_info "Detected firewall manager: ${fw}"
-  case "$fw" in
-    nftables)
-      log_info "Managing nftables"
-      local nft_base="nft add table inet linkzero >/dev/null 2>&1 || true; nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/dev/null 2>&1 || true;"
-      precheck_and_perform_firewall_action "nftables" "Ensure nftables table/chain exists" "$nft_base"
-      precheck_and_perform_firewall_action "nftables" "Allow Submission (port 587)" "$nft_base nft add rule inet linkzero input tcp dport 587 accept >/dev/null 2>&1 || true"
-      precheck_and_perform_firewall_action "nftables" "Allow SMTP (port 25)" "$nft_base nft add rule inet linkzero input tcp dport 25 accept >/dev/null 2>&1 || true"
-      precheck_and_perform_firewall_action "nftables" "Allow SMTPS (port 465)" "$nft_base nft add rule inet linkzero input tcp dport 465 accept >/dev/null 2>&1 || true"
-      ;;
-    csf)
-      log_info "Managing CSF"
-      perform_action "Reload CSF firewall" "csf -r || true"
-      precheck_and_perform_firewall_action "csf" "Ensure /etc/csf/csf.conf has TCP_IN 25,587,465" "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
-      ;;
-    firewalld)
-      log_info "Managing firewalld"
-      precheck_and_perform_firewall_action "firewalld" "Open port 587/tcp permanently" "firewall-cmd --permanent --add-port=587/tcp"
-      precheck_and_perform_firewall_action "firewalld" "Open port 25/tcp permanently" "firewall-cmd --permanent --add-port=25/tcp"
-      precheck_and_perform_firewall_action "firewalld" "Open port 465/tcp permanently" "firewall-cmd --permanent --add-port=465/tcp"
-      precheck_and_perform_firewall_action "firewalld" "Reload firewalld" "firewall-cmd --reload"
-      ;;
-    iptables)
-      log_info "Managing iptables only"
-      precheck_and_perform_firewall_action "iptables" "Allow Submission (port 587)" "iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
-      precheck_and_perform_firewall_action "iptables" "Allow SMTP (port 25)" "iptables -I INPUT -p tcp --dport 25 -j ACCEPT"
-      precheck_and_perform_firewall_action "iptables" "Allow SMTPS (port 465)" "iptables -I INPUT -p tcp --dport 465 -j ACCEPT"
-      ;;
-    none|*)
-      log_info "No recognized firewall manager detected; skipping firewall changes."
-      echo -e "${YELLOW}No active firewall manager detected (csf, nftables, firewalld, iptables).${RESET}"
-      ;;
-  esac
-}
-
-# Mail-server detection: cPanel -> exim -> postfix -> none
 detect_active_mailserver() {
   MAIL_SERVER_VARIANT=""; MAIL_SERVER_VARIANT_ASSUMED=""; EXIM_VERSION="unknown"
 
-  # Broad cPanel detection; if found, assume Exim (cPanel).
-  # If cPanel markers found but exim binary is not visible, mark as "assumed".
   if [[ -d /usr/local/cpanel ]] || [[ -d /var/cpanel ]] || [[ -f /usr/local/cpanel/version ]] || \
      [[ -f /var/cpanel/exim.conf ]] || [[ -f /var/cpanel/main_exim.conf ]] || \
      [[ -x /usr/local/cpanel/bin/rebuildeximconf ]] || [[ -x /scripts/rebuildeximconf ]]; then
     MAIL_SERVER_VARIANT="cPanel"
     if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
       MAIL_SERVER_VARIANT_ASSUMED=""
-      # capture version
       local ev; ev="$(exim -bV 2>&1 || true)"
       EXIM_VERSION="$(printf '%s\n' "$ev" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
       EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
@@ -260,18 +226,17 @@ detect_active_mailserver() {
     echo "exim"; return 0
   fi
 
-  # If not cPanel, detect exim binary and version
   if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
     local ev; ev="$(exim -bV 2>&1 || true)"
     EXIM_VERSION="$(printf '%s\n' "$ev" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
     EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
     EXIM_VERSION="${EXIM_VERSION:-unknown}"
-    # if output references cPanel, mark variant (not assumed)
-    if printf '%s\n' "$ev" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then MAIL_SERVER_VARIANT="cPanel"; MAIL_SERVER_VARIANT_ASSUMED=""; fi
+    if printf '%s\n' "$ev" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then
+      MAIL_SERVER_VARIANT="cPanel"; MAIL_SERVER_VARIANT_ASSUMED=""
+    fi
     echo "exim"; return 0
   fi
 
-  # Postfix fallback
   if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
     echo "postfix"; return 0
   fi
@@ -279,7 +244,6 @@ detect_active_mailserver() {
   echo "none"; return 0
 }
 
-# Capitalize first letter for display
 capitalize_first() {
   local s="$1"; [[ -z "$s" ]] && { echo ""; return; }
   local first="${s:0:1}"; local rest="${s:1}"
@@ -313,9 +277,13 @@ configure_exim(){
   fi
 
   local exim_conf=""
-  if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"
-  elif [[ -f /etc/exim/exim.conf ]]; then exim_conf="/etc/exim/exim.conf"
-  elif [[ -f /etc/exim.conf ]]; then exim_conf="/etc/exim.conf"; fi
+  if [[ -f /etc/exim4/exim4.conf.template ]]; then
+    exim_conf="/etc/exim4/exim4.conf.template"
+  elif [[ -f /etc/exim/exim.conf ]]; then
+    exim_conf="/etc/exim/exim.conf"
+  elif [[ -f /etc/exim.conf ]]; then
+    exim_conf="/etc/exim.conf"
+  fi
 
   if [[ -z "$exim_conf" && "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
     local candidates=( "/var/cpanel/exim.conf" "/var/cpanel/main_exim.conf" "/var/cpanel/exim.conf.local" "/etc/exim.conf" "/etc/exim.conf.local" "/var/cpanel/userdata/*/exim.conf" )
@@ -328,7 +296,8 @@ configure_exim(){
       done
     done
     if [[ -z "$exim_conf" ]]; then
-      local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
+      local found
+      found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
     if [[ -n "$exim_conf" ]]; then
@@ -364,7 +333,8 @@ configure_exim(){
   fi
 
   if [[ -n "$exim_conf" ]]; then
-    local timestamp; timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    local timestamp
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
@@ -387,17 +357,10 @@ configure_exim(){
 }
 
 test_configuration(){
-  # Intentionally removed the interactive Exim "basic configuration info" action to avoid the
-  # "Action: Exim: basic configuration info / Apply? [ YES ] [ NO ]" prompt per your request.
-
+  # Exim interactive info prompt removed per request.
   if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then
     perform_action "Postfix: basic configuration check" "postfix check"
   fi
-
-  # If you still want a non-interactive Exim info output (without prompting), you can enable:
-  # if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-  #   log_info "Exim info: $(exim -bV 2>/dev/null || true)"
-  # fi
 }
 
 _print_summary(){
@@ -427,7 +390,6 @@ EOF
 main(){
   if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
 
-  # Big pixel-art QHTL logo (with double space between T and L)
   echo -e "${GREEN}"
   echo -e "   █████  █   █  █████        █      █        █   "
   echo -e "  █     █ █   █    █          █               █  █"
@@ -437,10 +399,7 @@ main(){
   echo -e "   █████  █   █    █          █████  █  █   █ █  █"
   echo -e "${NC}"
 
-  # Red bold capital Daniel Nowakowski below logo
   echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
-
-  # Display QHTL Zero header
   echo -e "${BLUE}========================================================"
   echo -e "        QHTL Zero Configurator SMTP Hardening    "
   echo -e "========================================================${NC}"
@@ -461,7 +420,6 @@ main(){
   local mail_svc
   mail_svc="$(detect_active_mailserver)"
 
-  # Build display label: CapitalizedName (version) (assumed cPanel)
   local svc_disp; svc_disp="$(capitalize_first "$mail_svc")"
   local variant_display=""
   if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
