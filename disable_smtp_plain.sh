@@ -5,12 +5,14 @@
 # --dry-run mode that produces no side effects on the running system.
 #
 # Changes in this revision:
-# - Do not print the actual command or any "Command:" lines to the terminal.
-# - Replace the previous "Accepted" / "Skipped" messages with a single concise,
-#   colored result message:
-#     - Green: "Changes has been successfully applied" (if action executed or dry-run)
-#     - Red:   "Changes has been rejected by user" (if user answered No)
-# - On actual command failure the script still reports the failure in red.
+# - Before prompting for any firewall-related interactive question, check whether
+#   the exact firewall change already exists. If it does, print a blue message
+#   "Firewall changes aren't necessary as looks like already matching" and skip
+#   the prompt for that action.
+# - Implement manager-specific existence checks for nftables, iptables,
+#   firewalld and CSF (TCP_IN in /etc/csf/csf.conf).
+# - Record "already" in ACTION_RESULTS for items that were detected as already
+#   present, and show them in the summary as [MATCH] (blue).
 #
 set -euo pipefail
 
@@ -41,7 +43,7 @@ fi
 # Arrays for summary
 declare -a ACTION_DESCS
 declare -a ACTION_CMDS
-declare -a ACTION_RESULTS   # values: executed / skipped / dry-accepted / failed
+declare -a ACTION_RESULTS   # values: executed / skipped / dry-accepted / failed / already
 
 log() {
   local level="$1"; shift
@@ -115,13 +117,130 @@ detect_active_firewall() {
   fi
 
   # iptables fallback
-  if command -v iptables-save >/dev/null 2>&1; then
+  if command -v iptables-save >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1; then
     echo "iptables"
     return 0
   fi
 
   echo "none"
   return 0
+}
+
+# Firewall existence checks
+# Returns 0 when the given command/change already exists on the system for the given manager.
+firewall_change_exists() {
+  local manager="$1"; shift
+  local cmd="$*"
+
+  # helper: check presence of a single port in various managers
+  port_present_in_nft() {
+    local port="$1"
+    nft list ruleset 2>/dev/null | grep -E -q "dport[[:space:]]+$port|dport[[:space:]]+${port}[[:space:]]" && nft list ruleset 2>/dev/null | grep -q "accept"
+  }
+
+  port_present_in_firewalld() {
+    local port="$1"
+    # check permanent list (we changed permanent rules in the script)
+    firewall-cmd --permanent --list-ports 2>/dev/null | tr ' ' '\n' | grep -xq "${port}/tcp"
+  }
+
+  port_present_in_iptables() {
+    local port="$1"
+    # iptables -C returns 0 if rule exists
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 && return 0 || return 1
+    fi
+    return 1
+  }
+
+  csf_tcp_in_contains_ports() {
+    local want_ports=("$@")
+    local line
+    if [[ -r /etc/csf/csf.conf ]]; then
+      # Extract TCP_IN value, strip spaces and quotes
+      line="$(sed -nE 's/^[[:space:]]*TCP_IN[[:space:]]*=[[:space:]]*//Ip' /etc/csf/csf.conf | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+      # if multiple matches, first non-empty
+      if [[ -z "$line" ]]; then
+        # try fallback grep to get complete line
+        line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 | sed -E 's/^[^=]*=[[:space:]]*//')"
+        line="$(echo "$line" | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+      fi
+      if [[ -z "$line" ]]; then
+        return 1
+      fi
+      # Now check each wanted port exists in the comma-separated list
+      IFS=',' read -ra existing <<< "$line"
+      for want in "${want_ports[@]}"; do
+        local found=1
+        for ex in "${existing[@]}"; do
+          if [[ "$ex" == "$want" ]]; then
+            found=0
+            break
+          fi
+        done
+        if [[ $found -ne 0 ]]; then
+          return 1
+        fi
+      done
+      return 0
+    fi
+    return 1
+  }
+
+  # Look for obvious port numbers referenced in the command
+  local ports_found=()
+  # match numbers like 25, 587, 465
+  while read -r p; do
+    [[ -n "$p" ]] && ports_found+=("$p")
+  done < <(echo "$cmd" | grep -oE '([0-9]{2,5})' | tr '\n' ' ' | tr ' ' '\n' | sort -u)
+
+  # CSF special check: if command mentions TCP_IN ensure check for ports 25,587,465
+  if [[ "$manager" == "csf" ]]; then
+    if echo "$cmd" | grep -qi "TCP_IN"; then
+      # detect ports in the message or default to common smtp ports if none parsed
+      local want=("25" "587" "465")
+      if csf_tcp_in_contains_ports "${want[@]}"; then
+        return 0
+      else
+        return 1
+      fi
+    fi
+  fi
+
+  # For nftables, iptables and firewalld check ports discovered in the command
+  if [[ "${#ports_found[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  for port in "${ports_found[@]}"; do
+    # sanity: skip weird numbers > 65535
+    if ((port < 1 || port > 65535)); then
+      continue
+    fi
+    case "$manager" in
+      nftables)
+        if port_present_in_nft "$port"; then
+          # if any of the ports is present as an accept rule, we consider it matched
+          return 0
+        fi
+        ;;
+      firewalld)
+        if port_present_in_firewalld "$port"; then
+          return 0
+        fi
+        ;;
+      iptables)
+        if port_present_in_iptables "$port"; then
+          return 0
+        fi
+        ;;
+      csf)
+        # For csf other than TCP_IN check, we don't auto-match (fallback)
+        ;;
+    esac
+  done
+
+  return 1
 }
 
 # Terminal arrow-based chooser:
@@ -208,20 +327,16 @@ perform_action(){
   local desc="$1"; shift
   local cmd="$*"
 
-  # Show only the action (no "Command:" or other command info printed to terminal)
+  # Show only the action (no "Command:" printed to terminal)
   echo -e "${CYAN}${BOLD}Action:${RESET} ${desc}"
 
-  # record the command internally so we can show statuses and log it, but do NOT print "Command:" to stdout.
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
-
-  # log the planned command (not shown to terminal)
   log_info "Planned command for action: $cmd"
 
   if choose_yes_no "Apply?"; then
     # User answered YES
     if [[ "${DRY_RUN}" == "true" ]]; then
-      # dry-run: do not execute, but show confirmation message
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
       log_info "DRY-RUN: would run: $cmd"
@@ -249,6 +364,28 @@ perform_action(){
   fi
 }
 
+# Wrapper that checks whether the firewall change is already present and only prompts
+# if it is not present.
+precheck_and_perform_firewall_action() {
+  local manager="$1"; shift
+  local desc="$1"; shift
+  local cmd="$*"
+
+  # If the change already exists, inform in blue and record "already" result and don't prompt.
+  if firewall_change_exists "$manager" "$cmd"; then
+    # Print informational blue message as requested
+    printf "%b%s%b\n" "${BLUE}" "Firewall changes aren't necessary as looks like already matching" "${RESET}"
+    ACTION_DESCS+=("$desc")
+    ACTION_CMDS+=("$cmd")
+    ACTION_RESULTS+=("already")
+    log_info "Skipped firewall action (already present): $desc"
+    return 0
+  fi
+
+  # Not present -> do regular perform_action (which will prompt).
+  perform_action "$desc" "$cmd"
+}
+
 # Configure firewall: only act on the detected active firewall manager.
 configure_firewall() {
   local fw
@@ -260,34 +397,37 @@ configure_firewall() {
       log_info "Managing nftables only; csf/firewalld/iptables will be muted."
       local nft_base="nft add table inet linkzero >/dev/null 2>&1 || true; \
 nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/dev/null 2>&1 || true;"
-      perform_action "Ensure nftables table/chain exists (linkzero inet filter)" \
+      precheck_and_perform_firewall_action "nftables" "Ensure nftables table/chain exists (linkzero inet filter)" \
         "$nft_base"
 
-      perform_action "Allow Submission (port 587) in nftables" \
+      precheck_and_perform_firewall_action "nftables" "Allow Submission (port 587) in nftables" \
         "$nft_base nft add rule inet linkzero input tcp dport 587 accept >/dev/null 2>&1 || true"
-      perform_action "Allow SMTP (port 25) in nftables" \
+      precheck_and_perform_firewall_action "nftables" "Allow SMTP (port 25) in nftables" \
         "$nft_base nft add rule inet linkzero input tcp dport 25 accept >/dev/null 2>&1 || true"
-      perform_action "Allow SMTPS (port 465) in nftables" \
+      precheck_and_perform_firewall_action "nftables" "Allow SMTPS (port 465) in nftables" \
         "$nft_base nft add rule inet linkzero input tcp dport 465 accept >/dev/null 2>&1 || true"
       ;;
     csf)
       log_info "Managing CSF only; firewalld/iptables/nftables will be muted."
+      # Reload CSF - treat as action (no precheck)
       perform_action "Reload CSF (ConfigServer) firewall" "csf -r || true"
-      perform_action "Notify to ensure /etc/csf/csf.conf includes TCP_IN ports 25,587,465" \
+
+      # For the TCP_IN notification, pre-check the TCP_IN contents and only prompt if ports are missing
+      precheck_and_perform_firewall_action "csf" "Notify to ensure /etc/csf/csf.conf includes TCP_IN ports 25,587,465" \
         "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
       ;;
     firewalld)
       log_info "Managing firewalld only; csf/iptables will be muted."
-      perform_action "Open port 587/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=587/tcp"
-      perform_action "Open port 25/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=25/tcp"
-      perform_action "Open port 465/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=465/tcp"
-      perform_action "Reload firewalld to apply permanent changes" "firewall-cmd --reload"
+      precheck_and_perform_firewall_action "firewalld" "Open port 587/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=587/tcp"
+      precheck_and_perform_firewall_action "firewalld" "Open port 25/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=25/tcp"
+      precheck_and_perform_firewall_action "firewalld" "Open port 465/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=465/tcp"
+      precheck_and_perform_firewall_action "firewalld" "Reload firewalld to apply permanent changes" "firewall-cmd --reload"
       ;;
     iptables)
       log_info "Managing iptables only (no higher-level manager detected)."
-      perform_action "Allow Submission (port 587)" "iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
-      perform_action "Allow SMTP (port 25)" "iptables -I INPUT -p tcp --dport 25 -j ACCEPT"
-      perform_action "Allow SMTPS (port 465)" "iptables -I INPUT -p tcp --dport 465 -j ACCEPT"
+      precheck_and_perform_firewall_action "iptables" "Allow Submission (port 587)" "iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
+      precheck_and_perform_firewall_action "iptables" "Allow SMTP (port 25)" "iptables -I INPUT -p tcp --dport 25 -j ACCEPT"
+      precheck_and_perform_firewall_action "iptables" "Allow SMTPS (port 465)" "iptables -I INPUT -p tcp --dport 465 -j ACCEPT"
       ;;
     none|*)
       log_info "No recognized firewall manager detected; skipping firewall changes."
@@ -366,6 +506,7 @@ _print_summary(){
       failed)       printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
       skipped)      printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
       dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
+      already)      printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "$BLUE" "$RESET" "$d" ;;
       *)             printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
     esac
   done
