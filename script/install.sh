@@ -59,18 +59,84 @@ chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 
 log_info "Configuring firewall rules..."
 
-# Begin LinkZero firewalld/cPanel integration
+# Detect firewall type and act accordingly.
+# Possible values: firewalld, csf, nftables, iptables, none
+firewall_type="none"
 if command -v firewall-cmd >/dev/null 2>&1; then
-  echo "Detected firewalld — using script/firewalld-support.sh helper"
-  script/firewalld-support.sh enable || true
-  script/firewalld-support.sh add-interface "${WAN_IF:-eth0}" public || true
-  script/firewalld-support.sh add-masquerade public || true
-  # If cPanel/CSF is present, the helper will delegate add-port/remove-port to CSF. Still call add-port for LinkZero ports.
-  script/firewalld-support.sh add-port "${WG_PORT:-51820}" udp public || true
-  script/firewalld-support.sh add-port "${API_PORT:-8080}" tcp public || true
+    firewall_type="firewalld"
+elif command -v csf >/dev/null 2>&1 || [[ -f /etc/csf/csf.conf ]]; then
+    firewall_type="csf"
+elif command -v nft >/dev/null 2>&1; then
+    firewall_type="nftables"
+elif command -v iptables >/dev/null 2>&1; then
+    firewall_type="iptables"
 else
-  # existing iptables/nftables logic remains unchanged for systems without firewalld
-  echo "firewalld not found; keeping existing firewall configuration path"
+    firewall_type="none"
+fi
+
+# Handle firewalld specially: attempt to fetch and use the repo helper; otherwise fallback to firewall-cmd directly.
+if [[ "$firewall_type" == "firewalld" ]]; then
+    log_info "Detected firewall: firewalld (will attempt to use script/firewalld-support.sh helper)"
+
+    HELPER_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/firewalld-support.sh"
+    TMP_HELPER="/tmp/linkzero-firewalld-helper-$$.sh"
+    fetched_helper=false
+
+    # Try to fetch the helper into a temporary file (do not attempt to call local script/firewalld-support.sh)
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL "$HELPER_URL" -o "$TMP_HELPER"; then
+            fetched_helper=true
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q -O "$TMP_HELPER" "$HELPER_URL"; then
+            fetched_helper=true
+        fi
+    fi
+
+    if $fetched_helper && [[ -s "$TMP_HELPER" ]]; then
+        # Ensure executable
+        chmod +x "$TMP_HELPER" || true
+
+        # Run helper commands via the temporary helper file. Guard each call so failures won't abort install.
+        "$TMP_HELPER" enable || true
+        "$TMP_HELPER" add-interface "${WAN_IF:-eth0}" public || true
+        "$TMP_HELPER" add-masquerade public || true
+        # If cPanel/CSF is present, the helper will delegate add-port/remove-port to CSF. Still call add-port for LinkZero ports.
+        "$TMP_HELPER" add-port "${WG_PORT:-51820}" udp public || true
+        "$TMP_HELPER" add-port "${API_PORT:-8080}" tcp public || true
+
+        # Clean up the temporary helper
+        rm -f "$TMP_HELPER" || true
+    else
+        # Helper fetch failed: do not call a non-existent local helper. Fall back to firewall-cmd direct operations.
+        log_warn "firewalld helper could not be retrieved; falling back to firewall-cmd directly"
+
+        # Add interface to public zone (if supported)
+        if firewall-cmd --help >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone=public --add-interface="${WAN_IF:-eth0}" >/dev/null 2>&1 || true
+            firewall-cmd --permanent --zone=public --add-masquerade >/dev/null 2>&1 || true
+            firewall-cmd --permanent --zone=public --add-port="${WG_PORT:-51820}/udp" >/dev/null 2>&1 || true
+            firewall-cmd --permanent --zone=public --add-port="${API_PORT:-8080}/tcp" >/dev/null 2>&1 || true
+            # Try to reload firewalld to apply permanent changes; don't abort if reload fails.
+            firewall-cmd --reload >/dev/null 2>&1 || true
+        else
+            log_warn "firewall-cmd is not usable despite detection; skipping direct firewall-cmd calls"
+        fi
+    fi
+
+elif [[ "$firewall_type" == "csf" ]]; then
+    # If CSF is present, do not attempt to call firewalld helper
+    log_info "Detected firewall: csf (ConfigServer Security & Firewall). Installer will not call firewalld helper."
+    # Keep existing behavior for CSF (do not call helper)
+else
+    # nftables, iptables, or none: keep existing fallback behavior but use log_info for consistency
+    if [[ "$firewall_type" == "nftables" ]]; then
+        log_info "Detected nftables; keeping existing firewall configuration path"
+    elif [[ "$firewall_type" == "iptables" ]]; then
+        log_info "Detected iptables; keeping existing firewall configuration path"
+    else
+        log_info "No known firewall detected; keeping existing firewall configuration path"
+    fi
 fi
 # End LinkZero firewalld/cPanel integration
 
