@@ -4,27 +4,22 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Display change in this revision:
-# - The "[INFO] Detected mail server" line now prints the service with:
-#     CapitalizedName (version) (assumed cPanel)
-#   Examples:
-#     [INFO] Detected mail server: Exim (4.94) (assumed cPanel)
-#     [INFO] Detected mail server: Exim (4.94) (cPanel)
-#     [INFO] Detected mail server: Postfix
+# This revision:
+# - Restore interactive prompting that waits for the user's response.
+# - Ensure prompts read from the controlling terminal (/dev/tty) when present
+#   so the script blocks for input even if stdin/stdout are redirected.
+# - Fix a typo in the firewall-change detection helper that could cause errors.
 #
-# Other behavior: backups are non-interactive and use .link0; commands logged
-# to LOG_FILE only. Edits/restarts remain interactive.
 set -euo pipefail
 
 # Ensure terminal state restored on exit
 on_exit() {
-  # restore terminal settings in case the script hid the cursor or changed stty
   tput cnorm 2>/dev/null || true
   stty sane 2>/dev/null || true
 }
 trap on_exit EXIT
 
-# Colors (fallback) - ensure defined before any logging when set -u is used
+# Colors (fallback)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -112,38 +107,57 @@ perform_backup() {
 }
 
 # interactive yes/no chooser
-# This implementation reads from /dev/tty when available so the prompt will
-# wait for the user's response even if stdin is redirected. It falls back to
-# stdin when /dev/tty is not present.
+# This implementation:
+# - prefers /dev/tty (controlling terminal) so the prompt waits even if stdin is redirected.
+# - provides the arrow/visual selector UI (like original) and waits for a single keypress.
+# - restores the cursor and terminal mode on exit.
 choose_yes_no() {
   local prompt="$1"
-  local reply
-  # Attempt to prompt on the controlling terminal first
+  local sel=0 key
+  local input_fd
+  # Use /dev/tty when available to ensure blocking prompt on the terminal
   if [[ -r /dev/tty ]]; then
-    while true; do
-      printf "%s [y/N]: " "$prompt" > /dev/tty
-      if ! read -r reply < /dev/tty; then
-        # If reading fails, default to No
-        return 1
-      fi
-      case "${reply,,}" in
-        y|yes) return 0 ;;
-        n|no|"" ) return 1 ;;
-        *) printf "Please answer 'y' or 'n'.\n" > /dev/tty ;;
-      esac
-    done
+    exec 3<>/dev/tty
+    input_fd=3
   else
-    # Fallback: use standard input
-    while true; do
-      printf "%s [y/N]: " "$prompt"
-      if ! read -r reply; then return 1; fi
-      case "${reply,,}" in
-        y|yes) return 0 ;;
-        n|no|"" ) return 1 ;;
-        *) echo "Please answer 'y' or 'n'." ;;
-      esac
-    done
+    # Fall back to stdin
+    input_fd=0
   fi
+
+  # If not an interactive terminal at all, default to No
+  if ! [[ -t "$input_fd" ]]; then
+    if [[ "$input_fd" -eq 0 && ! -t 0 ]]; then
+      # Non-interactive environment -> default to No
+      echo "$prompt"
+      echo "Non-interactive terminal: defaulting to 'No'"
+      [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  tput civis 2>/dev/null || true
+  while true; do
+    printf '\r\033[K' >&$input_fd
+    if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
+    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >&$input_fd
+
+    # Read one keypress from the chosen fd
+    IFS= read -rsn1 -u "$input_fd" key 2>/dev/null || key=''
+
+    # If an escape sequence, read the rest of it (arrow keys)
+    if [[ $key == $'\x1b' ]]; then
+      IFS= read -rsn2 -t 0.0005 -u "$input_fd" rest 2>/dev/null || rest=''
+      key+="$rest"
+    fi
+
+    case "$key" in
+      $'\n'|$'\r'|'') printf "\n" >&$input_fd; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && { [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; return 0; } || { [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; return 1; } ;;
+      $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
+      h|H|l|L) sel=$((1 - sel)) ;;
+      q|Q) printf "\n" >&$input_fd; echo -e "${RED}Aborted by user.${RESET}" >&$input_fd; tput cnorm 2>/dev/null || true; [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; exit 1 ;;
+      *) ;;
+    esac
+  done
 }
 
 perform_action(){
@@ -162,7 +176,7 @@ perform_action(){
     return 0
   fi
 
-  # Normal mode: prompt the user and wait for a response (reads from /dev/tty when possible)
+  # Prompt the user and wait for response (reads from /dev/tty when possible)
   if choose_yes_no "Apply?"; then
     log_command_to_file_only "INFO" "Executing command" "$cmd"
     if eval "$cmd"; then
@@ -205,7 +219,7 @@ detect_active_firewall() {
 }
 
 # simple extraction check for firewall changes (kept compact)
-firebase_change_exists() {
+firewall_change_exists() {
   local manager="$1"; shift
   local cmd="$*"
   local ports; ports="$(echo "$cmd" | grep -oE '([0-9]{2,5})' | tr '\n' ' ' | tr ' ' '\n' | sort -u || true)"
@@ -218,8 +232,8 @@ firebase_change_exists() {
       csf)
         if [[ -r /etc/csf/csf.conf ]]; then
           local line; line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 || true)"
-          line="${line#*=}"; line="${line//"/}"; line="${line//'/'}"; line="${line// /}"
-          for p in 25 465 587; do grep -q "^$p$" <<<"${line//,/\n}" && return 0 || true; done
+          line="${line#*=}"; line="${line//\"/}"; line="${line//\'/}"; line="${line// /}"
+          for p in 25 465 587; do grep -q "^$p\$" <<<"${line//,/\\n}" && return 0 || true; done
         fi ;;
     esac
   done
@@ -380,7 +394,7 @@ configure_exim(){
       perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; find '$exim_conf' -type f -name '*.conf' -exec sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/ d' {} + || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
-      local sed_cmd="sed -i.link0 -E 's/^\s*AUTH_CLIENT_ALLOW_NOTLS\b.*//I' '$exim_conf' || true"
+      local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
       perform_backup "Backup Exim config file" "$backup_cmd"
       perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim config" "$sed_cmd"
     fi
@@ -403,12 +417,12 @@ _print_summary(){
   local i
   for i in "${!ACTION_DESCS[@]}"; do
     local d="${ACTION_DESCS[$i]}"; local r="${ACTION_RESULTS[$i]}"
-    case "${r}" in
-      executed) printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "${GREEN}" "$RESET" "$d" ;;
-      failed) printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "${RED}" "$RESET" "$d" ;;
-      skipped) printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "${MAGENTA}" "$RESET" "$d" ;;
-      dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "${YELLOW}" "$RESET" "$d" ;;
-      already) printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "${BLUE}" "$RESET" "$d" ;;
+    case "$r" in
+      executed) printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "$GREEN" "$RESET" "$d" ;;
+      failed) printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
+      skipped) printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
+      dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
+      already) printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "$BLUE" "$RESET" "$d" ;;
       *) printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
     esac
   done
@@ -493,7 +507,6 @@ echo -e ""
   log_info "Completed smtp-hardening run"
   _print_summary
 
-  # ensure we exit cleanly (trap will restore terminal state)
   exit 0
 }
 
