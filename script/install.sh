@@ -14,6 +14,8 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 ORANGE='\033[0;33m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
 
 # Clear the screen and print the header when stdout is a terminal.
 if [[ -t 1 ]]; then
@@ -28,7 +30,12 @@ echo -e "  █     █ █████    █          █      █  ███�
 echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
 echo -e "   █████  █   █    █          █████  █  █   █ █  █"
 echo -e "${NC}"
-echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+
+# We'll print the author line below and animate it if we have a tty.
+AUTHOR_TEXT=" a u t h o r :    D A N I E L    N O W A K O W S K I"
+
+# Print the author line initially in RED (fallback)
+echo -e "${RED}${BOLD}${AUTHOR_TEXT}${NC}"
 echo -e "${BLUE}========================================================"
 echo -e "        QHTL Zero Configurator SMTP Hardening    "
 echo -e "========================================================${NC}"
@@ -167,6 +174,105 @@ download_script_to_temp() {
     fi
 }
 
+# --------------- Rainbow author animation helpers ----------------
+
+# Variables to hold animator PID and author position
+ANIM_PID=""
+AUTHOR_ROW=""
+AUTHOR_COL=""
+
+# Get the cursor position (row;col) by querying the terminal. Requires INPUT_FD and OUTPUT_PATH set.
+# Returns "row;col" on stdout, or empty string on failure.
+get_cursor_pos() {
+    # REQUIRE: INPUT_FD readable, OUTPUT_PATH writable
+    if [[ -z "$INPUT_FD" ]] || [[ ! -r "$INPUT_FD" ]]; then
+        return 1
+    fi
+    # Save terminal settings, set raw mode temporarily to read response
+    local oldstty
+    oldstty=$(stty -g <"$INPUT_FD" 2>/dev/null || true)
+    stty raw -echo <"$INPUT_FD" 2>/dev/null || true
+    # Request cursor position
+    printf '\033[6n' >"$OUTPUT_PATH" 2>/dev/null
+    # Read response of the form ESC[row;colR]
+    local response
+    # read up to 'R'
+    IFS=';' read -r -d R response <"$INPUT_FD" 2>/dev/null || true
+    # restore terminal settings
+    if [[ -n "$oldstty" ]]; then
+        stty "$oldstty" <"$INPUT_FD" 2>/dev/null || true
+    fi
+    # response will contain something like ^[[24;1
+    # strip leading ESC and '['
+    response="${response#*[}"
+    # split
+    local row="${response%%;*}"
+    local col="${response#*;}"
+    if [[ -n "$row" && -n "$col" ]]; then
+        printf "%s;%s" "$row" "$col"
+        return 0
+    fi
+    return 1
+}
+
+# Animator: cycles through colors and updates the author line at a fixed absolute position.
+# Usage: animate_author <row> <col>
+animate_author() {
+    local row="$1" col="$2"
+    local colors=("$RED" "$ORANGE" "$YELLOW" "$GREEN" "$CYAN" "$BLUE" "$MAGENTA")
+    local idx=0
+    # Protect against missing OUTPUT_PATH
+    local out="${OUTPUT_PATH:-/dev/stdout}"
+    while true; do
+        local color="${colors[$((idx % ${#colors[@]}))]}"
+        # Save cursor, move to absolute pos, print colored author, restore cursor
+        printf '\033[s' >"$out" 2>/dev/null || true
+        printf '\033[%s;%sH' "$row" "$col" >"$out" 2>/dev/null || true
+        # Print and pad to clear previous content
+        printf "%b%s%b" "$color" "$BOLD$AUTHOR_TEXT$NC" >"$out" 2>/dev/null || true
+        printf "%b" "   " >"$out" 2>/dev/null || true
+        printf '\033[u' >"$out" 2>/dev/null || true
+        sleep 0.15
+        idx=$((idx+1))
+    done
+}
+
+start_rainbow_author() {
+    # Only start if we have a real tty to interact with
+    if [[ "$USE_TTY_FD" != true ]]; then
+        return 1
+    fi
+    open_io
+    if [[ -z "$INPUT_FD" || -z "$OUTPUT_PATH" ]]; then
+        return 1
+    fi
+    # After printing the author line, the cursor is at the end of that line.
+    # Query cursor position to capture the author line location.
+    local pos
+    pos="$(get_cursor_pos)" || return 1
+    AUTHOR_ROW="${pos%;*}"
+    AUTHOR_COL="${pos#*;}"
+    # Start animator in background, detached from job control
+    animate_author "$AUTHOR_ROW" "$AUTHOR_COL" >/dev/null 2>&1 &
+    ANIM_PID=$!
+    # Ensure we try to kill background children on exit
+    kill_animator_on_exit() {
+        kill_animator
+    }
+    trap 'kill_animator' EXIT
+    return 0
+}
+
+kill_animator() {
+    if [[ -n "${ANIM_PID:-}" ]]; then
+        kill "${ANIM_PID}" 2>/dev/null || true
+        wait "${ANIM_PID}" 2>/dev/null || true
+        ANIM_PID=""
+    fi
+}
+
+# --------------- End rainbow helpers ----------------
+
 # Pre-autostart numeric menu (3 options: launch, dry, none)
 choose_prelaunch_mode() {
     open_io
@@ -247,7 +353,8 @@ install_action() {
     log "Installing LinkZero..."
     ensure_install_dir
     TMP_DL="$(mktemp /tmp/linkzero-XXXXXX.sh)"
-    trap 'rm -f "${TMP_DL}"' EXIT
+    # ensure both temp cleanup and animator kill happen on exit from this function
+    trap 'rm -f "${TMP_DL}"; kill_animator' EXIT
     if ! download_script_to_temp "$SCRIPT_URL" "$TMP_DL"; then
         err "Failed to download $SCRIPT_URL"; exit 1
     fi
@@ -273,6 +380,7 @@ install_action() {
     fi
 
     # For other modes (launch/dry) preserve previous behavior and exit installer after completing.
+    kill_animator
     exec 3<&- 2>/dev/null || true
     exit 0
 }
@@ -294,8 +402,8 @@ if [[ -n "$ACTION" ]]; then
     try_open_tty || true
     debug_dump
     case "$ACTION" in
-        install) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
-        uninstall) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+        install) install_action; kill_animator; exec 3<&- 2>/dev/null || true; exit 0 ;;
+        uninstall) uninstall_action; kill_animator; exec 3<&- 2>/dev/null || true; exit 0 ;;
     esac
 fi
 
@@ -313,9 +421,14 @@ fi
 if [[ "$CAN_MENU" != true ]]; then
     warn "Interactive menu not available — running non-interactive install."
     install_action
+    kill_animator
     exec 3<&- 2>/dev/null || true
     exit 0
 fi
+
+# Start rainbow animation for the author line (only if we have a tty)
+try_open_tty || true
+start_rainbow_author || true
 
 # Numeric-style interactive main menu loop
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
@@ -358,6 +471,7 @@ while true; do
             ;;
         3|q|Q)
             echo "Exit." >"$OUTPUT_PATH"
+            kill_animator
             exec 3<&- 2>/dev/null || true
             exit 0
             ;;
@@ -369,5 +483,6 @@ while true; do
 done
 
 # close fd 3 (should be unreachable)
+kill_animator
 exec 3<&- 2>/dev/null || true
 exit 0
