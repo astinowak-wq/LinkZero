@@ -74,10 +74,28 @@ configure_firewall(){
     log_info "Configuring firewall rules to allow submission on port 587 and enforce TLS-only AUTH"
     backup_iptables_snapshot
 
-    # Example rule to accept submission (port 587)
-    run_or_echo iptables -I INPUT -p tcp --dport 587 -j ACCEPT
+    # In strict dry-run mode, do not execute any firewall commands.
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        # Echo the exact commands that would be executed so the operator can review.
+        echo "+ iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
+        # Add any additional intended firewall commands here (examples below)
+        echo "+ iptables -I INPUT -p tcp --dport 25 -j ACCEPT   # example: allow SMTP"
+        echo "+ iptables -I INPUT -p tcp --dport 465 -j ACCEPT  # example: allow SMTPS"
+        # If CSF is present, show that we'd reload it.
+        if command -v csf >/dev/null 2>&1; then
+            echo "+ csf -r"
+        fi
+        log_info "Dry-run: firewall changes were not applied"
+        return 0
+    fi
 
-    # If CSF (ConfigServer) is installed, reload it. In dry-run only echo.
+    # Real run: apply rules (use run_or_echo as a safety wrapper)
+    run_or_echo iptables -I INPUT -p tcp --dport 587 -j ACCEPT
+    # Example additional rules (uncomment or adjust as needed for your environment)
+    run_or_echo iptables -I INPUT -p tcp --dport 25 -j ACCEPT
+    run_or_echo iptables -I INPUT -p tcp --dport 465 -j ACCEPT
+
+    # If CSF (ConfigServer) is installed, reload it.
     if command -v csf >/dev/null 2>&1; then
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
             echo "+ csf -r"
@@ -195,7 +213,7 @@ main(){
     # parse args (only --dry-run currently)
     for arg in "$@"; do
         case "$arg" in
-            --dry-run) DRY_RUN=true ;;
+            --dry-run) DRY_RUN=true ;; 
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown option: $arg"; usage; exit 2 ;;
         esac
