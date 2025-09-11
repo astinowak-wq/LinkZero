@@ -17,6 +17,12 @@
 #
 set -euo pipefail
 
+# Colors (fallback) - ensure defined before any logging when set -u is used
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
 LOG_FILE="/var/log/linkzero-smtp-security.log"
 DRY_RUN="${DRY_RUN:-false}"
 
