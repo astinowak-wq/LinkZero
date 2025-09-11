@@ -5,14 +5,13 @@
 # --dry-run mode that produces no side effects on the running system.
 #
 # Changes in this revision:
-# - Before prompting for any firewall-related interactive question, check whether
-#   the exact firewall change already exists. If it does, print a blue message
-#   "Firewall changes aren't necessary as looks like already matching" and skip
-#   the prompt for that action.
-# - Implement manager-specific existence checks for nftables, iptables,
-#   firewalld and CSF (TCP_IN in /etc/csf/csf.conf).
-# - Record "already" in ACTION_RESULTS for items that were detected as already
-#   present, and show them in the summary as [MATCH] (blue).
+# - When printing log messages to the terminal, do NOT print the timestamp
+#   before the [LEVEL] prefix. Timestamps are still written to the logfile.
+# - Behavior:
+#     * Terminal (interactive): prints "[LEVEL] message" (no timestamp)
+#     * Non-interactive (or when output is not a TTY): prints "YYYY-MM-DDTHH:MM:SSZ [LEVEL] message"
+#       so timestamps remain available for automation/redirected output.
+#     * When not --dry-run, all messages (with timestamp) are appended to LOG_FILE.
 #
 set -euo pipefail
 
@@ -45,15 +44,31 @@ declare -a ACTION_DESCS
 declare -a ACTION_CMDS
 declare -a ACTION_RESULTS   # values: executed / skipped / dry-accepted / failed / already
 
+# Improved log(): don't print timestamps to terminal; keep timestamps in logfile or non-tty output.
 log() {
   local level="$1"; shift
   local msg="$*"
   local ts
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
   if [[ "${DRY_RUN}" == "true" ]]; then
-    printf '%s [%s] %s\n' "$ts" "$level" "$msg"
+    # In dry-run mode: show concise output to terminal when interactive, otherwise include timestamp
+    if [[ -t 1 ]]; then
+      printf '[%s] %s\n' "$level" "$msg"
+    else
+      printf '%s [%s] %s\n' "$ts" "$level" "$msg"
+    fi
   else
-    printf '%s [%s] %s\n' "$ts" "$level" "$msg" | tee -a "$LOG_FILE"
+    # Append full timestamped entry to logfile (best-effort, don't fail on write)
+    printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+
+    # For interactive terminals, print without timestamp to keep UI clean
+    if [[ -t 1 ]]; then
+      printf '[%s] %s\n' "$level" "$msg"
+    else
+      # For non-interactive, print full timestamped line as well (useful when redirecting)
+      printf '%s [%s] %s\n' "$ts" "$level" "$msg"
+    fi
   fi
 }
 log_info(){ log "INFO" "$@"; }
@@ -140,13 +155,11 @@ firewall_change_exists() {
 
   port_present_in_firewalld() {
     local port="$1"
-    # check permanent list (we changed permanent rules in the script)
     firewall-cmd --permanent --list-ports 2>/dev/null | tr ' ' '\n' | grep -xq "${port}/tcp"
   }
 
   port_present_in_iptables() {
     local port="$1"
-    # iptables -C returns 0 if rule exists
     if command -v iptables >/dev/null 2>&1; then
       iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 && return 0 || return 1
     fi
@@ -157,18 +170,14 @@ firewall_change_exists() {
     local want_ports=("$@")
     local line
     if [[ -r /etc/csf/csf.conf ]]; then
-      # Extract TCP_IN value, strip spaces and quotes
       line="$(sed -nE 's/^[[:space:]]*TCP_IN[[:space:]]*=[[:space:]]*//Ip' /etc/csf/csf.conf | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
-      # if multiple matches, first non-empty
       if [[ -z "$line" ]]; then
-        # try fallback grep to get complete line
         line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 | sed -E 's/^[^=]*=[[:space:]]*//')"
         line="$(echo "$line" | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
       fi
       if [[ -z "$line" ]]; then
         return 1
       fi
-      # Now check each wanted port exists in the comma-separated list
       IFS=',' read -ra existing <<< "$line"
       for want in "${want_ports[@]}"; do
         local found=1
@@ -189,15 +198,12 @@ firewall_change_exists() {
 
   # Look for obvious port numbers referenced in the command
   local ports_found=()
-  # match numbers like 25, 587, 465
   while read -r p; do
     [[ -n "$p" ]] && ports_found+=("$p")
   done < <(echo "$cmd" | grep -oE '([0-9]{2,5})' | tr '\n' ' ' | tr ' ' '\n' | sort -u)
 
-  # CSF special check: if command mentions TCP_IN ensure check for ports 25,587,465
   if [[ "$manager" == "csf" ]]; then
     if echo "$cmd" | grep -qi "TCP_IN"; then
-      # detect ports in the message or default to common smtp ports if none parsed
       local want=("25" "587" "465")
       if csf_tcp_in_contains_ports "${want[@]}"; then
         return 0
@@ -207,20 +213,17 @@ firewall_change_exists() {
     fi
   fi
 
-  # For nftables, iptables and firewalld check ports discovered in the command
   if [[ "${#ports_found[@]}" -eq 0 ]]; then
     return 1
   fi
 
   for port in "${ports_found[@]}"; do
-    # sanity: skip weird numbers > 65535
     if ((port < 1 || port > 65535)); then
       continue
     fi
     case "$manager" in
       nftables)
         if port_present_in_nft "$port"; then
-          # if any of the ports is present as an accept rule, we consider it matched
           return 0
         fi
         ;;
@@ -235,7 +238,6 @@ firewall_change_exists() {
         fi
         ;;
       csf)
-        # For csf other than TCP_IN check, we don't auto-match (fallback)
         ;;
     esac
   done
@@ -258,18 +260,14 @@ choose_yes_no() {
     return 1
   fi
 
-  # selection: 0 = YES, 1 = NO
   local sel=0
   local key
 
-  # hide cursor if possible
   tput civis 2>/dev/null || true
 
   while true; do
-    # clear line and render prompt with colored selected option
     printf '\r\033[K'
 
-    # Selected option uses color, unselected uses terminal default color
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"
       option_no="NO"
@@ -278,21 +276,17 @@ choose_yes_no() {
       option_no="${RED}NO${RESET}"
     fi
 
-    # Prompt remains highlighted so it's obvious what you're answering; options are not bold.
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
 
-    # read one key (raw, silent)
     IFS= read -rsn1 key 2>/dev/null || key=''
 
-    # If it's an escape, read remaining bytes of the sequence (arrow keys)
     if [[ $key == $'\x1b' ]]; then
-      # read up to two more bytes (common CSI sequences are 3 bytes total)
       IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
       key+="$rest"
     fi
 
     case "$key" in
-      $'\n'|$'\r'|'')   # Enter pressed
+      $'\n'|$'\r'|'')
         printf "\n"
         tput cnorm 2>/dev/null || true
         if [[ $sel -eq 0 ]]; then
@@ -301,7 +295,7 @@ choose_yes_no() {
           return 1
         fi
         ;;
-      $'\x1b[C'|$'\x1b[D')  # Right or Left arrow
+      $'\x1b[C'|$'\x1b[D')
         sel=$((1 - sel))
         ;;
       h|H|l|L)
@@ -314,7 +308,6 @@ choose_yes_no() {
         exit 1
         ;;
       *)
-        # ignore other keys
         ;;
     esac
   done
@@ -335,7 +328,6 @@ perform_action(){
   log_info "Planned command for action: $cmd"
 
   if choose_yes_no "Apply?"; then
-    # User answered YES
     if [[ "${DRY_RUN}" == "true" ]]; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
@@ -343,7 +335,6 @@ perform_action(){
       return 0
     fi
 
-    # Attempt execution (no command echoed to terminal)
     if eval "$cmd"; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
       log_success "$desc"
@@ -356,7 +347,6 @@ perform_action(){
       return 1
     fi
   else
-    # User answered NO -> show rejection message in red (no "Skipped:" line)
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped")
     log_info "User rejected action: $desc (command: $cmd)"
@@ -371,9 +361,7 @@ precheck_and_perform_firewall_action() {
   local desc="$1"; shift
   local cmd="$*"
 
-  # If the change already exists, inform in blue and record "already" result and don't prompt.
   if firewall_change_exists "$manager" "$cmd"; then
-    # Print informational blue message as requested
     printf "%b%s%b\n" "${BLUE}" "Firewall changes aren't necessary as looks like already matching" "${RESET}"
     ACTION_DESCS+=("$desc")
     ACTION_CMDS+=("$cmd")
@@ -382,7 +370,6 @@ precheck_and_perform_firewall_action() {
     return 0
   fi
 
-  # Not present -> do regular perform_action (which will prompt).
   perform_action "$desc" "$cmd"
 }
 
@@ -409,10 +396,8 @@ nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/de
       ;;
     csf)
       log_info "Managing CSF only; firewalld/iptables/nftables will be muted."
-      # Reload CSF - treat as action (no precheck)
       perform_action "Reload CSF (ConfigServer) firewall" "csf -r || true"
 
-      # For the TCP_IN notification, pre-check the TCP_IN contents and only prompt if ports are missing
       precheck_and_perform_firewall_action "csf" "Notify to ensure /etc/csf/csf.conf includes TCP_IN ports 25,587,465" \
         "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
       ;;
