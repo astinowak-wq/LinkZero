@@ -1,19 +1,23 @@
 #!/bin/bash
 #
 # LinkZero installer — interactive menu with improved tty detection
+# and a short pre-autostart menu that appears right after installation
+# (between the "[INFO] Installed to ..." line and the orange "Warning: ..." line).
 #
-# Test: run 'sudo bash script/install.sh' (or download and run) to see Uninstall preselected when
-#       the script is already installed at /usr/local/bin/linkzero-smtp.
+# The pre-autostart menu is separate from the main install/uninstall menu and only
+# runs just before the installed program would be auto-started. It lets the user
+# choose per-run behavior: launch (foreground), background, none, or dry-run.
 #
 set -euo pipefail
 
-# -- Early header: show logo/author even when falling back to non-interactive mode --
+# -- Colors / header --
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
-NC='\033[0;0m'
+NC='\033[0m'
+ORANGE='\033[0;33m'
 
 # Clear the screen and print the header when stdout is a terminal.
 if [[ -t 1 ]]; then
@@ -54,17 +58,11 @@ err()    { echo -e "${RED}[ERR]${NC} $*"; }
 # 1) /dev/tty
 # 2) SUDO_TTY (if set)
 # 3) don't open anything (we will only use stdin if it's a real tty)
-# Implementation note:
-# Previously this function required a non-blocking read probe to mark fd3 usable.
-# That probe caused failures in some sudo/piped environments. Now we treat a successful
-# exec 3<... as sufficient to indicate a usable terminal fd.
 USE_TTY_FD=false
 try_open_tty() {
-    # close previous fd3 if any
     exec 3<&- 2>/dev/null || true
 
     if [[ -r /dev/tty ]]; then
-        # If we can open /dev/tty for read, treat that as a usable terminal input fd.
         if exec 3</dev/tty 2>/dev/null; then
             USE_TTY_FD=true
             return 0
@@ -90,14 +88,12 @@ try_open_tty() {
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
-        # read from fd3 (blocking). This allows interactive menus even when stdin is not a tty.
         IFS= read -rsn1 key <&3 2>/dev/null || key=''
         if [[ $key == $'\x1b' ]]; then
             IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || rest=''
             key+="$rest"
         fi
     else
-        # only read from stdin if stdin is tty
         if [[ -t 0 ]]; then
             IFS= read -rsn1 key 2>/dev/null || key=''
             if [[ $key == $'\x1b' ]]; then
@@ -151,6 +147,122 @@ download_script_to_temp() {
     fi
 }
 
+# ------------------ NEW: pre-autostart menu (only invoked inside install_action) ----------
+# show a tiny numbered menu on the user's terminal (prefers fd3 or /dev/tty).
+# returns one of: launch|background|none|dry (printed to stdout)
+choose_prelaunch_mode() {
+    local default="launch"
+    local out="/dev/tty"
+    local in_fd="/dev/tty"
+
+    # If we don't have a terminal at all, return default immediately.
+    if [[ "$USE_TTY_FD" != true && ! -r /dev/tty && ! -t 0 ]]; then
+        printf "%s" "$default"
+        return 0
+    fi
+
+    # prefer /dev/tty for both in/out when available
+    if [[ -r /dev/tty ]]; then
+        out="/dev/tty"
+        in_fd="/dev/tty"
+    elif [[ "$USE_TTY_FD" == true ]]; then
+        # fd3 is available for reading; output to /dev/stdout so messages remain visible
+        out="/dev/stdout"
+        in_fd="/dev/fd/3"
+    fi
+
+    printf "\n" >"$out"
+    printf "%b\n" "${ORANGE}Select what should happen after installation for this run:${NC}" >"$out"
+    printf " 1) launch     - start program in foreground after countdown\n" >"$out"
+    printf " 2) background - start program in background after countdown\n" >"$out"
+    printf " 3) none       - do NOT start program after install\n" >"$out"
+    printf " 4) dry        - simulate install (remove installed file) and do NOT launch\n" >"$out"
+    printf "\n" >"$out"
+    printf "Press Enter to use default (launch).\n" >"$out"
+    printf "\n" >"$out"
+
+    local choice=""
+    # read choice using /dev/tty or fd3
+    if [[ -r "$in_fd" ]]; then
+        # use read with -r so it works with fd path
+        read -r -p "Choose [1-4]: " choice <"$in_fd" 2>/dev/null || choice=""
+    else
+        read -r -p "Choose [1-4]: " choice 2>/dev/null || choice=""
+    fi
+
+    if [[ -z "$choice" ]]; then
+        printf "%s" "$default"
+        return 0
+    fi
+
+    case "$choice" in
+        1) printf "launch" ;;
+        2) printf "background" ;;
+        3) printf "none" ;;
+        4) printf "dry" ;;
+        *) printf "%s" "$default" ;;
+    esac
+}
+
+# Countdown + optional launch — prints the requested orange warning and a 5s countdown.
+countdown_and_apply_mode() {
+    local install_path="$1"
+    local mode="$2"
+    local seconds=5
+    local out="/dev/tty"
+    if [[ ! -r /dev/tty ]]; then
+        out="/dev/stdout"
+    fi
+
+    # Print the orange warning line (user asked it to be visible between the two lines)
+    printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$out"
+
+    for ((i=seconds;i>=1;i--)); do
+        printf "\r%bStarting in %d... %b" "$ORANGE" "$i" "$NC" >"$out"
+        sleep 1
+    done
+    printf "\n" >"$out"
+
+    case "$mode" in
+        dry)
+            printf "%b\n" "${YELLOW}Dry-run: simulated install; not launching.${NC}" >"$out"
+            return 0
+            ;;
+        none)
+            printf "%b\n" "${YELLOW}Autostart disabled for this run; not launching.${NC}" >"$out"
+            return 0
+            ;;
+        background)
+            if [[ ! -x "$install_path" ]]; then
+                printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
+                return 0
+            fi
+            printf "%b\n" "${GREEN}Starting ${install_path} in background${NC}" >"$out"
+            nohup "$install_path" >/dev/null 2>&1 &
+            return 0
+            ;;
+        launch)
+            if [[ ! -x "$install_path" ]]; then
+                printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
+                return 0
+            fi
+            printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$out"
+            # attach to terminal if possible
+            if [[ -r /dev/tty ]]; then
+                exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty
+            else
+                # fallback to running in background if no tty for exec
+                nohup "$install_path" >/dev/null 2>&1 &
+            fi
+            ;;
+        *)
+            printf "%b\n" "${YELLOW}Unknown mode: %s${NC}" "$mode" >"$out"
+            return 0
+            ;;
+    esac
+}
+
+# install_action now shows the new pre-autostart menu (separate from main menu)
 install_action() {
     log "Installing LinkZero..."
     ensure_install_dir
@@ -162,10 +274,26 @@ install_action() {
     if grep -qiE '<!doctype html|<html' "$TMP_DL" 2>/dev/null; then
         err "Downloaded file looks like HTML; check raw URL"; exit 1
     fi
+
     install_path="$INSTALL_DIR/$SCRIPT_NAME"
     mv "$TMP_DL" "$install_path"
     chmod +x "$install_path"
     log "Installed to $install_path"
+
+    # === NEW: show the pre-autostart menu here, AFTER the "[INFO] Installed to ..." line ===
+    # This menu is intentionally independent from the main (install/uninstall) menu.
+    # It only controls immediate post-install behavior and does not affect main menu state.
+    try_open_tty || true     # ensure fd3 is available if possible
+    local chosen_mode
+    chosen_mode="$(choose_prelaunch_mode)" || chosen_mode="launch"
+
+    # If the user selected dry, simulate by removing the installed file (system remains unchanged)
+    if [[ "$chosen_mode" == "dry" ]]; then
+        rm -f "$install_path" || true
+    fi
+
+    # Show the orange warning and 5-second countdown, and then apply the chosen mode.
+    countdown_and_apply_mode "$install_path" "$chosen_mode"
 }
 
 uninstall_action() {
@@ -220,9 +348,7 @@ fi
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 
 # Preselect Uninstall if the script appears already installed.
-# This improves UX: users who already have LinkZero installed are likely trying to uninstall.
-# Override: use --install or --uninstall flags, or --interactive to force the menu.
-if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
+if [[ -x "/usr/local/bin/$SCRIPT_NAME" ]] || [[ -f "/usr/local/bin/$SCRIPT_NAME" ]]; then
     sel=1
 else
     sel=0
