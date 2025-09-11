@@ -2,14 +2,11 @@
 #
 # LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# Changes:
-# - Removed "background" pre-autostart option.
-# - Pre-autostart choices are now:
-#     1) launch
-#     2) dry   (run installed binary with --dry-run)
-#     3) none  (do NOT start program after install)  <-- returns to main menu
-# - If the user selects "none" after install, the installer returns to the main menu.
-# - dry mode runs the binary with --dry-run attached to /dev/tty when possible.
+# Updates:
+# - Removed delay/countdown for pre-autostart option "3) none": when selected the installer
+#   will return to the main menu immediately after install.
+# - Countdown for options that do use it (launch/dry) is now shown on a single line
+#   (overwrites the same line each second).
 #
 set -euo pipefail
 
@@ -200,6 +197,8 @@ choose_prelaunch_mode() {
 }
 
 # Countdown + apply mode
+# - For "none": do NOT do a countdown; return immediately.
+# - For "launch" and "dry": show a single-line countdown that overwrites itself.
 countdown_and_apply_mode() {
     local install_path="$1"
     local mode="$2"
@@ -207,11 +206,19 @@ countdown_and_apply_mode() {
     open_io
     local out="$OUTPUT_PATH"
 
-    printf "%b\n" "${ORANGE}Warning: the installed program may be started automatically in ${seconds} seconds.${NC}" >"$out"
+    if [[ "$mode" == "none" ]]; then
+        printf "%b\n" "${YELLOW}Autostart disabled for this run; not launching.${NC}" >"$out"
+        return 0
+    fi
+
+    # single-line countdown: overwrite same line each second
     for ((i=seconds;i>=1;i--)); do
-        printf "%b\n" "${ORANGE}Starting in ${i}...${NC}" >"$out"
+        # \r to return to line start, \033[K to erase to end of line
+        printf "\r\033[KStarting in %d..." "$i" >"$out"
         sleep 1
     done
+    # clear the countdown line after finishing
+    printf "\r\033[K" >"$out"
 
     case "$mode" in
         dry)
@@ -228,10 +235,6 @@ countdown_and_apply_mode() {
                 # no tty; run detached so installer can continue/exit cleanly
                 nohup "$install_path" --dry-run >/dev/null 2>&1 &
             fi
-            return 0
-            ;;
-        none)
-            printf "%b\n" "${YELLOW}Autostart disabled for this run; not launching.${NC}" >"$out"
             return 0
             ;;
         launch)
@@ -276,12 +279,11 @@ install_action() {
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
 
-    # Perform countdown + apply for selected mode.
-    # If user selected "none", we will NOT exit the installer; we return to main menu after displaying status.
+    # If chosen "none", do NOT wait/countdown and return immediately to the main menu.
     countdown_and_apply_mode "$install_path" "$chosen_mode"
 
     if [[ "$chosen_mode" == "none" ]]; then
-        # Return to caller (main menu) so user can choose again, per request.
+        # return to main menu (caller is the menu loop)
         return 0
     fi
 
