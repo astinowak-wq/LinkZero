@@ -1,9 +1,12 @@
 #!/bin/bash
 #
-# LinkZero installer — numeric-menu main menu + pre-autostart numeric menu
+# LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# Uses line-based numeric input for the main menu (1/2/3) and pre-autostart (1-4).
-# Uninstall removes the installed file without confirmation and then returns to the main menu.
+# - Uses a dedicated tty fd (fd 3 -> /dev/fd/3) or /dev/tty for prompts to avoid
+#   accidental EOF from stdin terminating the menu loop.
+# - Uninstall removes the installed file without confirmation and RETURNS to the main menu.
+# - Install still performs installation; autostart choices are supported but the installer
+#   is NOT replaced by the launched program (we avoid exec'ing the installed binary).
 #
 set -euo pipefail
 
@@ -102,6 +105,7 @@ open_io() {
         INPUT_FD="/dev/tty"
         OUTPUT_PATH="/dev/tty"
     elif [[ -t 0 ]]; then
+        # fallback to stdin/stdout if it's a real tty
         INPUT_FD="/dev/stdin"
         OUTPUT_PATH="/dev/stdout"
     else
@@ -202,7 +206,7 @@ countdown_and_apply_mode() {
     open_io
     local out="$OUTPUT_PATH"
 
-    printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$out"
+    printf "%b\n" "${ORANGE}Warning: the installed program may be started automatically in ${seconds} seconds.${NC}" >"$out"
     for ((i=seconds;i>=1;i--)); do
         printf "%b\n" "${ORANGE}Starting in ${i}...${NC}" >"$out"
         sleep 1
@@ -223,6 +227,7 @@ countdown_and_apply_mode() {
                 return 0
             fi
             printf "%b\n" "${GREEN}Starting ${install_path} in background${NC}" >"$out"
+            # start detached so installer keeps running
             nohup "$install_path" >/dev/null 2>&1 &
             return 0
             ;;
@@ -231,10 +236,10 @@ countdown_and_apply_mode() {
                 printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
                 return 0
             fi
-            printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$out"
-            # attach to terminal if possible
+            printf "%b\n" "${GREEN}Launching ${install_path} (attached if possible)${NC}" >"$out"
+            # Try to run attached to /dev/tty in a subshell so we don't replace the installer process.
             if [[ -w /dev/tty ]]; then
-                exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty
+                ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty ) &
             else
                 nohup "$install_path" >/dev/null 2>&1 &
             fi
@@ -262,15 +267,18 @@ install_action() {
     chmod +x "$install_path"
     log "Installed to $install_path"
 
-    # show the separate pre-autostart numeric menu
+    # pre-autostart numeric menu
     try_open_tty || true
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
-    # If user selected dry, remove the file before countdown/launch
     if [[ "$chosen_mode" == "dry" ]]; then
         rm -f "$install_path" || true
     fi
     countdown_and_apply_mode "$install_path" "$chosen_mode"
+
+    # After install we will exit the installer (preserve original behavior)
+    exec 3<&- 2>/dev/null || true
+    exit 0
 }
 
 uninstall_action() {
@@ -282,6 +290,7 @@ uninstall_action() {
 
     # Uninstall: no confirmation, just remove
     rm -f "$install_path" && log "Removed $install_path"
+    return 0
 }
 
 # If explicit action requested, do it and exit
@@ -343,13 +352,13 @@ while true; do
     case "$selection" in
         1)
             install_action
-            # After install, exit the installer run (preserves original behavior)
+            # unreachable because install_action exits, but keep for clarity
             exec 3<&- 2>/dev/null || true
             exit 0
             ;;
         2)
             uninstall_action
-            # After uninstall, return to top of the loop so the user can choose again
+            # After uninstall, show status then loop back so user can choose again
             continue
             ;;
         3|q|Q)
@@ -364,6 +373,6 @@ while true; do
     esac
 done
 
-# close fd 3 (should be unreachable, but keep for completeness)
+# close fd 3 (should be unreachable)
 exec 3<&- 2>/dev/null || true
 exit 0
