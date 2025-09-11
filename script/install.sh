@@ -1,31 +1,30 @@
 #!/bin/bash
 #
-# LinkZero Installation Script (resilient downloader, correct paths)
-# - Prefer the script inside "script/" directory
-# - Download to a secure temp file and validate it's not HTML before installing
-# - Keeps original firewall helper behavior
+# LinkZero Installation Script (refined)
+# Quick installer for CloudLinux SMTP security
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
-#   wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+# Usage: curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+# Or: wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+#
+# Changes in this revision:
+# - Removed verbose "Attempting to download" and explicit raw-URL HTML-warning lines that were printed during install.
+# - Downloads are now attempted quietly; only concise, non-redundant informational or error messages are shown.
+# - If downloaded content looks like an HTML page, the installer treats that as a failed download and moves on (no raw-URL echoing).
+# - Tries a small list of candidate raw URLs quietly before failing with a single clear error message.
 #
 
 set -euo pipefail
 
-REPO_OWNER="${REPO_OWNER:-astinowak-wq}"
-REPO_NAME="${REPO_NAME:-LinkZero}"
-BRANCH="${BRANCH:-main}"
-
-# Candidate raw paths for the real script (in order of preference)
-CANDIDATE_PATHS=(
-  "script/disable_smtp_plain.sh"
-  "disable_smtp_plain.sh"
+# Primary candidates for the script raw URL. Try these quietly (no repetitive attempt messages).
+CANDIDATE_URLS=(
+    "https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable_smtp_plain.sh"
+    "https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/disable_smtp_plain.sh"
 )
 
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-SCRIPT_NAME="${SCRIPT_NAME:-linkzero-smtp}"
+INSTALL_DIR="/usr/local/bin"
+SCRIPT_NAME="linkzero-smtp"
 
-# Default port variables for firewall configuration (used later if needed)
+# Default port variables for firewall configuration (kept from original script)
 WG_PORT="${WG_PORT:-51820}"
 API_PORT="${API_PORT:-8080}"
 WAN_IF="${WAN_IF:-eth0}"
@@ -36,120 +35,71 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 
-# Ensure temporary files are cleaned up on exit (success or failure)
-TMP_SCRIPT=""
-_cleanup() {
-    [[ -n "${TMP_SCRIPT:-}" && -f "$TMP_SCRIPT" ]] && rm -f "$TMP_SCRIPT" || true
-}
-trap _cleanup EXIT
-
-# Check root
+# Check if running as root
 if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
     exit 1
 fi
 
-log_info "Starting LinkZero installer..."
+log_info "Installing LinkZero SMTP Security Script..."
 
-# Helper: download an URL to a destination using curl or wget
-download_url() {
-    local url="$1"; local dest="$2"
+# Create temp file for download attempts
+TMP_DL="$(mktemp /tmp/linkzero-script-XXXXXX.sh)"
+trap 'rm -f "$TMP_DL"' EXIT
+
+download_ok=false
+for url in "${CANDIDATE_URLS[@]}"; do
+    # Try to fetch quietly; suppress curl text output (-s) and fail on HTTP errors (-f).
+    # We intentionally do not print the URL on each attempt to avoid noisy logs.
     if command -v curl >/dev/null 2>&1; then
-        curl -fLsS --retry 2 --retry-delay 1 "$url" -o "$dest"
-        return $?
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" "$url"
-        return $?
-    else
-        return 2
-    fi
-}
-
-# Validate downloaded file: non-empty, not HTML (doctype/html), and preferably has a shebang
-is_valid_script() {
-    local file="$1"
-    # file must be non-empty
-    [[ -s "$file" ]] || return 1
-    # First non-empty line
-    local first_nonempty_line
-    first_nonempty_line="$(sed -n '/\S/ {p;q;}' "$file" || true)"
-    [[ -n "$first_nonempty_line" ]] || return 1
-    # Reject obvious HTML pages
-    if echo "$first_nonempty_line" | grep -qiE '^<!DOCTYPE|^<html|^<!doctype|^<\!DOCTYPE'; then
-        return 2
-    fi
-    # Prefer shebang but don't strictly require it
-    return 0
-}
-
-selected_url=""
-for path in "${CANDIDATE_PATHS[@]}"; do
-    url="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${path}"
-    TMP_SCRIPT="$(mktemp -p /tmp linkzero-script-XXXXXX.sh)" || {
-        log_error "Failed to create temporary file for download"
-        exit 1
-    }
-
-    log_info "Attempting to download: $url"
-    if download_url "$url" "$TMP_SCRIPT"; then
-        if is_valid_script "$TMP_SCRIPT"; then
-            selected_url="$url"
-            log_info "Valid script downloaded from: $url"
-            break
-        else
-            # Determine reason
-            if is_valid_script "$TMP_SCRIPT"; then :; fi
-            # Check if it was HTML-like
-            first_nonempty_line="$(sed -n '/\S/ {p;q;}' "$TMP_SCRIPT" || true)"
-            if echo "$first_nonempty_line" | grep -qiE '^<!DOCTYPE|^<html|^<!doctype|^<\!DOCTYPE'; then
-                log_warn "Downloaded content from $url looks like an HTML page (likely a 404 or GitHub HTML response). Skipping."
-            else
-                log_warn "Downloaded file from $url is empty or doesn't look like a shell script. Skipping."
+        if curl -fsSL "$url" -o "$TMP_DL"; then
+            # Check whether the downloaded file is likely an HTML page (GitHub rendered page accidentally downloaded)
+            if grep -qiE '<!doctype html|<html' "$TMP_DL" 2>/dev/null; then
+                # treat as failure and try next candidate quietly
+                rm -f "$TMP_DL"
+                TMP_DL="$(mktemp /tmp/linkzero-script-XXXXXX.sh)"
+                continue
             fi
-            rm -f "$TMP_SCRIPT" || true
-            TMP_SCRIPT=""
-            continue
+            download_ok=true
+            break
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q -O "$TMP_DL" "$url"; then
+            if grep -qiE '<!doctype html|<html' "$TMP_DL" 2>/dev/null; then
+                rm -f "$TMP_DL"
+                TMP_DL="$(mktemp /tmp/linkzero-script-XXXXXX.sh)"
+                continue
+            fi
+            download_ok=true
+            break
         fi
     else
-        log_warn "Failed to download $url (network/HTTP error)."
-        rm -f "$TMP_SCRIPT" || true
-        TMP_SCRIPT=""
-        continue
+        log_error "Neither curl nor wget found. Please install one of them."
+        exit 1
     fi
 done
 
-if [[ -z "$selected_url" ]]; then
-    log_error "Unable to retrieve a valid shell script for disable_smtp_plain.sh from the repository."
-    echo ""
-    log_info "Tried these candidate raw URLs:"
-    for path in "${CANDIDATE_PATHS[@]}"; do
-        echo "  - https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${path}"
-    done
-    echo ""
-    log_info "Possible fixes:"
-    echo "  - Add the script at one of the candidate locations"
-    echo "  - Ensure BRANCH/REPO_OWNER/REPO_NAME environment variables are correct"
-    echo ""
-    echo "Debug commands you can run locally to inspect raw responses:"
-    echo "  curl -I \"https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${CANDIDATE_PATHS[0]}\""
-    echo "  curl -fsSL \"https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${CANDIDATE_PATHS[0]}\" | sed -n '1,20p'"
+if ! $download_ok; then
+    log_error "Failed to download the LinkZero script (network/HTTP error or invalid content)."
+    log_error "Please ensure the repository contains the raw script and try again."
     exit 1
 fi
 
-# Move validated script into place atomically
-chmod +x "$TMP_SCRIPT" || true
-mv -f "$TMP_SCRIPT" "$INSTALL_DIR/$SCRIPT_NAME"
-TMP_SCRIPT=""  # prevent trap from removing installed file
+# Move the verified script into place
+install_path="$INSTALL_DIR/$SCRIPT_NAME"
+mv "$TMP_DL" "$install_path"
+chmod +x "$install_path"
+log_info "Installed LinkZero script to: $install_path"
 
-log_info "Installed $INSTALL_DIR/$SCRIPT_NAME"
+# --- Firewall configuration handling (unchanged behaviour, refined small parts) ---
 
 log_info "Configuring firewall rules..."
 
-# Detect firewall type
+# Detect firewall type and act accordingly.
 firewall_type="none"
 if command -v csf >/dev/null 2>&1 || [[ -f /etc/csf/csf.conf ]]; then
     firewall_type="csf"
@@ -163,24 +113,39 @@ else
     firewall_type="none"
 fi
 
+# Handle firewalld specially: attempt to fetch and use the repo helper; otherwise fallback to firewall-cmd directly.
 if [[ "$firewall_type" == "firewalld" ]]; then
     log_info "Detected firewall: firewalld"
 
-    HELPER_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/script/firewalld-support.sh"
-    TMP_HELPER="$(mktemp -p /tmp linkzero-firewalld-helper-XXXXXX.sh)" || TMP_HELPER=""
+    HELPER_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/firewalld-support.sh"
+    TMP_HELPER="$(mktemp /tmp/linkzero-firewalld-helper-XXXXXX.sh)"
     fetched_helper=false
 
-    if [[ -n "${TMP_HELPER}" ]]; then
-        if download_url "$HELPER_URL" "$TMP_HELPER"; then
-            chmod +x "$TMP_HELPER" || true
-            fetched_helper=true
-        else
-            rm -f "$TMP_HELPER" || true
-            TMP_HELPER=""
+    # Try to fetch the helper quietly
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL "$HELPER_URL" -o "$TMP_HELPER"; then
+            # Verify not HTML
+            if ! grep -qiE '<!doctype html|<html' "$TMP_HELPER" 2>/dev/null; then
+                fetched_helper=true
+            else
+                rm -f "$TMP_HELPER"
+                TMP_HELPER="$(mktemp /tmp/linkzero-firewalld-helper-XXXXXX.sh)"
+            fi
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q -O "$TMP_HELPER" "$HELPER_URL"; then
+            if ! grep -qiE '<!doctype html|<html' "$TMP_HELPER" 2>/dev/null; then
+                fetched_helper=true
+            else
+                rm -f "$TMP_HELPER"
+                TMP_HELPER="$(mktemp /tmp/linkzero-firewalld-helper-XXXXXX.sh)"
+            fi
         fi
     fi
 
     if $fetched_helper && [[ -s "$TMP_HELPER" ]]; then
+        chmod +x "$TMP_HELPER" || true
+        # Run helper commands via the temporary helper file using an explicit shell
         bash "$TMP_HELPER" enable || true
         bash "$TMP_HELPER" add-interface "${WAN_IF:-eth0}" public || true
         bash "$TMP_HELPER" add-masquerade public || true
@@ -188,7 +153,8 @@ if [[ "$firewall_type" == "firewalld" ]]; then
         bash "$TMP_HELPER" add-port "${API_PORT:-8080}" tcp public || true
         rm -f "$TMP_HELPER" || true
     else
-        log_warn "firewalld helper could not be retrieved; falling back to firewall-cmd directly"
+        # Helper fetch failed or invalid; fall back to firewall-cmd direct operations quietly
+        log_warn "firewalld helper unavailable; falling back to direct firewall-cmd operations."
         if command -v firewall-cmd >/dev/null 2>&1; then
             firewall-cmd --permanent --zone=public --add-interface="${WAN_IF:-eth0}" >/dev/null 2>&1 || true
             firewall-cmd --permanent --zone=public --add-masquerade >/dev/null 2>&1 || true
@@ -196,20 +162,29 @@ if [[ "$firewall_type" == "firewalld" ]]; then
             firewall-cmd --permanent --zone=public --add-port="${API_PORT:-8080}/tcp" >/dev/null 2>&1 || true
             firewall-cmd --reload >/dev/null 2>&1 || true
         else
-            log_warn "firewall-cmd not available; skipping firewalld configuration"
+            log_warn "firewall-cmd is not usable despite firewalld detection; skipping direct firewall-cmd calls"
         fi
     fi
 
 elif [[ "$firewall_type" == "csf" ]]; then
-    log_info "Detected firewall: csf (ConfigServer Security & Firewall). Installer will not modify CSF automatically beyond what the script does."
+    log_info "Detected firewall: csf (ConfigServer Security & Firewall). Installer will not call firewalld helper."
 else
-    log_info "Firewall type: $firewall_type — no automated changes made by installer in this branch."
+    if [[ "$firewall_type" == "nftables" ]]; then
+        log_info "Detected nftables; keeping existing firewall configuration path"
+    elif [[ "$firewall_type" == "iptables" ]]; then
+        log_info "Detected iptables; keeping existing firewall configuration path"
+    else
+        log_info "No known firewall detected; keeping existing firewall configuration path"
+    fi
 fi
 
-log_info "LinkZero installed successfully at $INSTALL_DIR/$SCRIPT_NAME"
+log_info "LinkZero SMTP Security Script installed successfully!"
+log_info "Location: $install_path"
 echo ""
-log_info "Try: $INSTALL_DIR/$SCRIPT_NAME --dry-run"
-log_warn "If you still see HTML in the installed file, check that the raw URL below is correct:"
-log_warn "  $selected_url"
-
-exit 0
+log_info "Usage examples:"
+echo "  $SCRIPT_NAME --help                # Show help"
+echo "  $SCRIPT_NAME --dry-run             # Preview changes"
+echo "  $SCRIPT_NAME --backup-only         # Backup only"
+echo "  $SCRIPT_NAME                       # Apply security configuration"
+echo ""
+log_warn "Remember to backup your configuration before running!"
