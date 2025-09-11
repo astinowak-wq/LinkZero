@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# LinkZero installer — interactive menu with robust tty/input handling (stty-based)
+# LinkZero installer — interactive menu with simplified, robust tty handling
 #
 set -euo pipefail
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
-# Print header early so logo/author show even if we later fall back
+# Print header early
 if [[ -t 1 ]]; then clear; fi
 echo -e "${GREEN}"
 echo -e "   █████  █   █  █████        █      █        █   "
@@ -28,7 +28,7 @@ SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="linkzero-smtp"
 
-# State flags
+# Flags
 ACTION=""; YES=false; FORCE=false; FORCE_MENU=false
 DEBUG="${DEBUG:-}"
 
@@ -36,110 +36,106 @@ log(){ echo -e "${GREEN}[INFO]${NC} $*"; }
 warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
 err(){ echo -e "${RED}[ERR]${NC} $*"; }
 
-# Try to open a terminal fd (3). Prefer /dev/tty then SUDO_TTY.
-USE_TTY_FD=false
-try_open_tty(){
+# Choose input device: prefer /dev/tty (for sudo/piped runs), otherwise use stdin.
+INPUT_DEV=""
+INPUT_FD=0
+open_input_dev() {
+    # close any existing fd 3
     exec 3<&- 2>/dev/null || true
     if [[ -r /dev/tty ]]; then
-        if exec 3</dev/tty 2>/dev/null; then USE_TTY_FD=true; return 0; fi
+        INPUT_DEV="/dev/tty"
+        exec 3<"$INPUT_DEV" 2>/dev/null || return 1
+        INPUT_FD=3
+        return 0
     fi
-    if [[ -n "${SUDO_TTY:-}" && -r "${SUDO_TTY}" ]]; then
-        if exec 3<"${SUDO_TTY}" 2>/dev/null; then USE_TTY_FD=true; return 0; fi
+    # fallback to stdin
+    if [[ -t 0 ]]; then
+        INPUT_DEV="stdin"
+        INPUT_FD=0
+        return 0
     fi
-    USE_TTY_FD=false
+    INPUT_DEV=""
     return 1
 }
 
-# Drain any pending bytes on the chosen input fd so stale input doesn't consume the user's press.
-drain_pending_input(){
-    if [[ "$USE_TTY_FD" == true ]]; then
-        # non-blocking short reads from fd3
-        while IFS= read -rsn1 -t 0.01 -u 3 _ 2>/dev/null; do :; done
-    elif [[ -t 0 ]]; then
-        while IFS= read -rsn1 -t 0.01 _ 2>/dev/null; do :; done
-    elif [[ -r /dev/tty ]]; then
-        exec 4</dev/tty 2>/dev/null || true
-        while IFS= read -rsn1 -t 0.01 -u 4 _ 2>/dev/null; do :; done
-        exec 4<&- 2>/dev/null || true
+close_input_dev() {
+    if [[ "$INPUT_FD" -eq 3 ]]; then
+        exec 3<&- 2>/dev/null || true
     fi
+    INPUT_DEV=""; INPUT_FD=0
 }
 
-# read a single key (blocking). Prefer fd3 when available.
-# Uses stty on the active input device to ensure immediate/noncanonical reads.
-# Sets global 'key' to the captured data; returns 0 on success, non-zero if no input device was available.
-read_key(){
+# Drain any pending bytes on the chosen input so stale presses don't get consumed.
+drain_pending_input() {
+    if ! open_input_dev >/dev/null 2>&1; then return 1; fi
+    if [[ "$INPUT_FD" -eq 3 ]]; then
+        # non-blocking short reads from fd 3
+        while IFS= read -rsn1 -t 0.01 -u 3 _ 2>/dev/null; do :; done
+    elif [[ "$INPUT_FD" -eq 0 ]]; then
+        while IFS= read -rsn1 -t 0.01 _ 2>/dev/null; do :; done
+    fi
+    return 0
+}
+
+# Read one key (blocking) from the chosen input device, using stty on the controlling tty.
+# Returns 0 and sets global 'key' on success; returns non-zero if no interactive device.
+read_key() {
     key=''
 
-    # helper to restore stty
-    restore_stty(){
-        if [[ -n "${OLD_STTY:-}" ]]; then
-            # restore using the same fd (3 or 4) if available
-            if [[ "${STTY_FD}" == "3" ]]; then stty "$OLD_STTY" -F /dev/tty 2>/dev/null || true
-            elif [[ "${STTY_FD}" == "4" ]]; then stty "$OLD_STTY" -F /dev/tty 2>/dev/null || true
-            else stty "$OLD_STTY" 2>/dev/null || true; fi
-        fi
-    }
+    # Open input device (sets INPUT_DEV and INPUT_FD)
+    if ! open_input_dev; then
+        key=''; return 1
+    fi
 
-    # 1) Prefer fd3 (persistent /dev/tty or SUDO_TTY)
-    if [[ "$USE_TTY_FD" == true ]]; then
-        # Capture current stty for /dev/tty (best-effort)
+    # Save current stty for /dev/tty if available (best-effort)
+    OLD_STTY=""
+    if [[ -r /dev/tty ]]; then
         OLD_STTY=$(stty -g </dev/tty 2>/dev/null || true)
-        STTY_FD=3
-        # put terminal into noncanonical mode for immediate reads
+        # non-canonical, no echo, immediate return for each keypress
         stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null || true
+    elif [[ -t 0 ]]; then
+        OLD_STTY=$(stty -g 2>/dev/null || true)
+        stty -icanon -echo min 1 time 0 2>/dev/null || true
+    fi
 
-        # blocking read one byte from fd3
+    # perform blocking read from chosen fd
+    if [[ "$INPUT_FD" -eq 3 ]]; then
         if read -rsn1 -u 3 key 2>/dev/null; then
+            # read remaining bytes of escape sequence (short timeout)
             if [[ $key == $'\x1b' ]]; then
-                # read up to 3 extra bytes (escape sequences can vary); short timeout
                 IFS= read -rsn3 -t 0.06 -u 3 rest 2>/dev/null || rest=''
                 key+="$rest"
             fi
-            restore_stty
-            return 0
         fi
-        restore_stty
-    fi
-
-    # 2) Fallback to stdin if it's a tty
-    if [[ -t 0 ]]; then
-        OLD_STTY=$(stty -g </dev/tty 2>/dev/null || true)
-        STTY_FD=0
-        stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null || true
-
+    else
+        # stdin
         if read -rsn1 key 2>/dev/null; then
             if [[ $key == $'\x1b' ]]; then
                 IFS= read -rsn3 -t 0.06 rest 2>/dev/null || rest=''
                 key+="$rest"
             fi
-            restore_stty
-            return 0
         fi
-        restore_stty
     fi
 
-    # 3) Last-resort: temporarily open /dev/tty on fd4 and use that
-    if [[ -r /dev/tty ]]; then
-        exec 4</dev/tty 2>/dev/null || true
-        OLD_STTY=$(stty -g </dev/tty 2>/dev/null || true)
-        STTY_FD=4
-        stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null || true
-
-        if read -rsn1 -u 4 key 2>/dev/null; then
-            if [[ $key == $'\x1b' ]]; then
-                IFS= read -rsn3 -t 0.06 -u 4 rest 2>/dev/null || rest=''
-                key+="$rest"
-            fi
-            restore_stty
-            exec 4<&- 2>/dev/null || true
-            return 0
+    # Restore stty
+    if [[ -n "$OLD_STTY" ]]; then
+        if [[ -r /dev/tty ]]; then
+            stty "$OLD_STTY" </dev/tty 2>/dev/null || true
+        else
+            stty "$OLD_STTY" 2>/dev/null || true
         fi
-        restore_stty
-        exec 4<&- 2>/dev/null || true
     fi
 
-    key=''
-    return 1
+    # close fd3 if we opened it
+    if [[ "$INPUT_FD" -eq 3 ]]; then
+        exec 3<&- 2>/dev/null || true
+    fi
+
+    # success if key non-empty
+    if [[ -z "$key" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # parse args
@@ -151,16 +147,16 @@ for arg in "$@"; do
         --force|-f) FORCE=true ;;
         --interactive) FORCE_MENU=true ;;
         -h|--help) printf "Usage: %s [--install|--uninstall] [--yes] [--interactive]\n" "$0"; exit 0 ;;
+        *) ;;
     esac
 done
 
-debug_dump(){
+debug_dump() {
     if [[ -n "$DEBUG" ]]; then
-        printf "DEBUG: -t0=%s -t1=%s SUDO_TTY=%s USE_TTY_FD=%s NONINTERACTIVE=%s CI=%s\n" \
+        printf "DEBUG: -t0=%s -t1=%s INPUT_DEV=%s NONINTERACTIVE=%s CI=%s\n" \
             "$( [[ -t 0 ]] && echo true || echo false )" \
             "$( [[ -t 1 ]] && echo true || echo false )" \
-            "${SUDO_TTY:-}" \
-            "$USE_TTY_FD" \
+            "${INPUT_DEV:-}" \
             "${NONINTERACTIVE:-}" \
             "${CI:-}"
     fi
@@ -218,35 +214,34 @@ uninstall_action(){
     log "Uninstall completed."
 }
 
-# If explicit action requested, do it and exit
+# explicit actions
 if [[ -n "$ACTION" ]]; then
-    try_open_tty || true
+    open_input_dev >/dev/null 2>&1 || true
     debug_dump
     case "$ACTION" in
-        install) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
-        uninstall) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+        install) install_action; close_input_dev; exit 0 ;;
+        uninstall) uninstall_action; close_input_dev; exit 0 ;;
     esac
 fi
 
-# Decide whether we can show the interactive menu
-try_open_tty || true
+# menu availability
+open_input_dev >/dev/null 2>&1 || true
 debug_dump
 
 CAN_MENU=false
-if [[ "$FORCE_MENU" == true ]]; then
-    CAN_MENU=true
-elif [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] && [[ -t 1 ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]] ); then
+if [[ "$FORCE_MENU" == true ]]; then CAN_MENU=true
+elif [[ -n "$INPUT_DEV" ]] && [[ -t 1 ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; then
     CAN_MENU=true
 fi
 
 if [[ "$CAN_MENU" != true ]]; then
     warn "Interactive menu not available — running non-interactive install."
     install_action
-    exec 3<&- 2>/dev/null || true
+    close_input_dev
     exit 0
 fi
 
-# Interactive menu
+# menu
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 declare -i sel=0
 if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" || -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then sel=1; else sel=0; fi
@@ -254,7 +249,7 @@ if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" || -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then 
 tput civis 2>/dev/null || true
 echo "Use the arrow keys and Enter to choose."
 
-# Ensure we don't have stale input before showing the menu
+# drain stale input
 drain_pending_input
 
 redraw_menu(){
@@ -271,7 +266,7 @@ while true; do
     if ! read_key; then
         warn "No interactive input read; falling back to non-interactive install."
         tput cnorm 2>/dev/null || true
-        exec 3<&- 2>/dev/null || true
+        close_input_dev
         install_action
         exit 0
     fi
@@ -280,29 +275,20 @@ while true; do
         $'\n'|$'\r')
             tput cnorm 2>/dev/null || true
             case $((sel)) in
-                0) exec 3<&- 2>/dev/null || true; install_action; exit 0 ;;
-                1) exec 3<&- 2>/dev/null || true; uninstall_action; exit 0 ;;
-                2) exec 3<&- 2>/dev/null || true; echo "Exit."; exit 0 ;;
+                0) close_input_dev; install_action; exit 0 ;;
+                1) close_input_dev; uninstall_action; exit 0 ;;
+                2) close_input_dev; echo "Exit."; exit 0 ;;
             esac
             ;;
         $'\x1b'*)
-            # handle escape sequences for arrows/keys
+            # arrow handling (common variants)
             case "$key" in
-                $'\x1b[A'|$'\x1bOD'|$'\x1b[1;2A') # up variants
-                    sel=$(( (sel - 1 + ${#options[@]}) % ${#options[@]} ))
-                    ;;
-                $'\x1b[B'|$'\x1bOC'|$'\x1b[1;2B') # down variants
-                    sel=$(( (sel + 1) % ${#options[@]} ))
-                    ;;
-                $'\x1b[D'|$'\x1bOD') # left
-                    sel=$(( (sel - 1 + ${#options[@]}) % ${#options[@]} ))
-                    ;;
-                $'\x1b[C'|$'\x1bOC') # right
-                    sel=$(( (sel + 1) % ${#options[@]} ))
-                    ;;
+                $'\x1b[A'|$'\x1b[1;2A'|$'\x1b[OA') sel=$(( (sel - 1 + ${#options[@]}) % ${#options[@]} ));;
+                $'\x1b[B'|$'\x1b[1;2B'|$'\x1b[OB') sel=$(( (sel + 1) % ${#options[@]} ));;
+                $'\x1b[D'|$'\x1b[OD') sel=$(( (sel - 1 + ${#options[@]}) % ${#options[@]} ));;
+                $'\x1b[C'|$'\x1b[OC') sel=$(( (sel + 1) % ${#options[@]} ));;
                 *) ;;
             esac
-            # redraw menu from new sel
             lines_to_move=$(( ${#options[@]} + 1 ))
             tput cuu "$lines_to_move" 2>/dev/null || printf '\033[%dA' "$lines_to_move"
             redraw_menu
@@ -313,5 +299,8 @@ while true; do
     esac
 done
 
+# cleanup
+close_input_dev
 exec 3<&- 2>/dev/null || true
+tput cnorm 2>/dev/null || true
 exit 0
