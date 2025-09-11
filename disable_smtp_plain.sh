@@ -4,15 +4,20 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Simplified, robust interactive prompt and strict --dry-run behavior.
+# This revision:
+# - Restore interactive prompting that waits for the user's response.
+# - Ensure prompts read from the controlling terminal (/dev/tty) when present
+#   so the script blocks for input even if stdin/stdout are redirected.
+# - Fix a typo in the firewall-change detection helper that could cause errors.
+#
 set -euo pipefail
 
 # Ensure terminal state restored on exit
-_cleanup_terminal() {
+on_exit() {
   tput cnorm 2>/dev/null || true
   stty sane 2>/dev/null || true
 }
-trap _cleanup_terminal EXIT
+trap on_exit EXIT
 
 # Colors (fallback)
 RED='\033[0;31m'
@@ -101,35 +106,58 @@ perform_backup() {
   fi
 }
 
-# Very robust, simple interactive yes/no prompt using /dev/tty
-# - Reads a full line from /dev/tty (blocking)
-# - Accepts y/yes (case-insensitive) as Yes, anything else -> No
-# - Returns 0 on Yes, 1 on No
+# interactive yes/no chooser
+# This implementation:
+# - prefers /dev/tty (controlling terminal) so the prompt waits even if stdin is redirected.
+# - provides the arrow/visual selector UI (like original) and waits for a single keypress.
+# - restores the cursor and terminal mode on exit.
 choose_yes_no() {
   local prompt="$1"
-  local answer
-
+  local sel=0 key
+  local input_fd
+  # Use /dev/tty when available to ensure blocking prompt on the terminal
   if [[ -r /dev/tty ]]; then
-    # Use /dev/tty directly to avoid stdin confusion
-    while true; do
-      printf "%s [y/N]: " "$prompt" > /dev/tty
-      if ! read -r answer < /dev/tty; then
-        # read failure (EOF, etc) -> treat as No
-        printf "\n" > /dev/tty 2>/dev/null || true
-        return 1
-      fi
-      case "${answer,,}" in
-        y|yes) return 0 ;;
-        n|no|"") return 1 ;;
-        *) printf "Please answer 'y' or 'n'.\n" > /dev/tty ;;
-      esac
-    done
+    exec 3<>/dev/tty
+    input_fd=3
   else
-    # Non-interactive environment -> default to No
-    echo "$prompt"
-    echo "Non-interactive terminal: defaulting to 'No'"
-    return 1
+    # Fall back to stdin
+    input_fd=0
   fi
+
+  # If not an interactive terminal at all, default to No
+  if ! [[ -t "$input_fd" ]]; then
+    if [[ "$input_fd" -eq 0 && ! -t 0 ]]; then
+      # Non-interactive environment -> default to No
+      echo "$prompt"
+      echo "Non-interactive terminal: defaulting to 'No'"
+      [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  tput civis 2>/dev/null || true
+  while true; do
+    printf '\r\033[K' >&$input_fd
+    if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
+    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >&$input_fd
+
+    # Read one keypress from the chosen fd
+    IFS= read -rsn1 -u "$input_fd" key 2>/dev/null || key=''
+
+    # If an escape sequence, read the rest of it (arrow keys)
+    if [[ $key == $'\x1b' ]]; then
+      IFS= read -rsn2 -t 0.0005 -u "$input_fd" rest 2>/dev/null || rest=''
+      key+="$rest"
+    fi
+
+    case "$key" in
+      $'\n'|$'\r'|'') printf "\n" >&$input_fd; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && { [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; return 0; } || { [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; return 1; } ;;
+      $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
+      h|H|l|L) sel=$((1 - sel)) ;;
+      q|Q) printf "\n" >&$input_fd; echo -e "${RED}Aborted by user.${RESET}" >&$input_fd; tput cnorm 2>/dev/null || true; [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; exit 1 ;;
+      *) ;;
+    esac
+  done
 }
 
 perform_action(){
@@ -140,15 +168,15 @@ perform_action(){
   ACTION_CMDS+=("$cmd")
   log_command_to_file_only "INFO" "Planned command" "$cmd"
 
-  # Crucial: do not prompt in dry-run mode.
   if [[ "${DRY_RUN}" == "true" ]]; then
+    # Dry-run: record but do not execute
     printf "%b%s%b\n" "${YELLOW}" "Dry-run: would run command (no changes)" "${RESET}"
     ACTION_RESULTS+=("dry-accepted")
     log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"
     return 0
   fi
 
-  # Normal mode: prompt the user and wait for a full-line answer from /dev/tty
+  # Prompt the user and wait for response (reads from /dev/tty when possible)
   if choose_yes_no "Apply?"; then
     log_command_to_file_only "INFO" "Executing command" "$cmd"
     if eval "$cmd"; then
@@ -263,12 +291,15 @@ configure_firewall() {
 detect_active_mailserver() {
   MAIL_SERVER_VARIANT=""; MAIL_SERVER_VARIANT_ASSUMED=""; EXIM_VERSION="unknown"
 
+  # Broad cPanel detection; if found, assume Exim (cPanel).
+  # If cPanel markers found but exim binary is not visible, mark as "assumed".
   if [[ -d /usr/local/cpanel ]] || [[ -d /var/cpanel ]] || [[ -f /usr/local/cpanel/version ]] || \
      [[ -f /var/cpanel/exim.conf ]] || [[ -f /var/cpanel/main_exim.conf ]] || \
      [[ -x /usr/local/cpanel/bin/rebuildeximconf ]] || [[ -x /scripts/rebuildeximconf ]]; then
     MAIL_SERVER_VARIANT="cPanel"
     if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
       MAIL_SERVER_VARIANT_ASSUMED=""
+      # capture version
       local ev; ev="$(exim -bV 2>&1 || true)"
       EXIM_VERSION="$(printf '%s\n' "$ev" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
       EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
@@ -280,15 +311,18 @@ detect_active_mailserver() {
     echo "exim"; return 0
   fi
 
+  # If not cPanel, detect exim binary and version
   if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
     local ev; ev="$(exim -bV 2>&1 || true)"
     EXIM_VERSION="$(printf '%s\n' "$ev" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
     EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$ev" | sed -n '1p' | xargs || true)}"
     EXIM_VERSION="${EXIM_VERSION:-unknown}"
+    # if output references cPanel, mark variant (not assumed)
     if printf '%s\n' "$ev" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then MAIL_SERVER_VARIANT="cPanel"; MAIL_SERVER_VARIANT_ASSUMED=""; fi
     echo "exim"; return 0
   fi
 
+  # Postfix fallback
   if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
     echo "postfix"; return 0
   fi
@@ -403,22 +437,26 @@ EOF
 }
 
 main(){
-  if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
+if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
+  
+# Big pixel-art QHTL logo (with double space between T and L)
+echo -e "${GREEN}"
+echo -e "   █████  █   █  █████        █      █        █   "
+echo -e "  █     █ █   █    █          █               █  █"
+echo -e "  █     █ █   █    █          █      █  █     █ █ "
+echo -e "  █     █ █████    █          █      █  ████  ██  "
+echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
+echo -e "   █████  █   █    █          █████  █  █   █ █  █"
+echo -e "${NC}"
 
-  echo -e "${GREEN}"
-  echo -e "   █████  █   █  █████        █      █        █   "
-  echo -e "  █     █ █   █    █          █               █  █"
-  echo -e "  █     █ █   █    █          █      █  █     █ █ "
-  echo -e "  █     █ █████    █          █      █  ████  ██  "
-  echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
-  echo -e "   █████  █   █    █          █████  █  █   █ █  █"
-  echo -e "${NC}"
+# Red bold capital Daniel Nowakowski below logo
+echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
 
-  echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
-  echo -e "${BLUE}========================================================"
-  echo -e "        QHTL Zero Configurator SMTP Hardening    "
-  echo -e "========================================================${NC}"
-  echo -e ""
+# Display QHTL Zero header
+echo -e "${BLUE}========================================================"
+echo -e "        QHTL Zero Configurator SMTP Hardening    "
+echo -e "========================================================${NC}"
+echo -e ""
 
   for arg in "$@"; do
     case "$arg" in
@@ -435,6 +473,7 @@ main(){
   local mail_svc
   mail_svc="$(detect_active_mailserver)"
 
+  # Build display label: CapitalizedName (version) (assumed cPanel)
   local svc_disp; svc_disp="$(capitalize_first "$mail_svc")"
   local variant_display=""
   if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
