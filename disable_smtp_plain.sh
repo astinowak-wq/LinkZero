@@ -5,9 +5,15 @@
 # --dry-run mode that produces no side effects on the running system.
 #
 # Display change in this revision:
-# - Use a robust /dev/tty-backed prompt that blocks on the controlling terminal
-#   and waits for a line-based response before continuing.
-# - Fallback to stdin when /dev/tty isn't available and the process is interactive.
+# - The "[INFO] Detected mail server" line now prints the service with:
+#     CapitalizedName (version) (assumed cPanel)
+#   Examples:
+#     [INFO] Detected mail server: Exim (4.94) (assumed cPanel)
+#     [INFO] Detected mail server: Exim (4.94) (cPanel)
+#     [INFO] Detected mail server: Postfix
+#
+# Other behavior: backups are non-interactive and use .link0; commands logged
+# to LOG_FILE only. Edits/restarts remain interactive.
 #
 set -euo pipefail
 
@@ -98,55 +104,24 @@ perform_backup() {
   fi
 }
 
-# interactive yes/no chooser (robust, line-based)
-# - prefers /dev/tty for blocking interactivity on the controlling terminal
-# - falls back to stdin if /dev/tty isn't available but stdin is a TTY
-# - returns 0 on Yes, 1 on No
+# interactive yes/no chooser
 choose_yes_no() {
   local prompt="$1"
-  local fd_opened=0
-  local answer
-
-  # Prefer controlling terminal
-  if [[ -w /dev/tty && -r /dev/tty ]]; then
-    exec 3<>/dev/tty
-    fd_opened=3
-  elif [[ -t 0 ]]; then
-    # fall back to stdin if it's a tty
-    exec 3<&0
-    fd_opened=3
-  else
-    # non-interactive: print prompt and default to No
-    echo "$prompt"
-    echo "Non-interactive terminal: defaulting to 'No'"
-    return 1
-  fi
-
-  # Drain any pending input on fd 3 to avoid stray bytes
-  # non-blocking read in a loop until nothing left
-  while IFS= read -r -t 0 -n 1024 junk <&3 2>/dev/null; do :; done || true
-
-  # Ask the question and wait for a full line (user presses Enter)
+  if ! [[ -t 0 ]]; then echo "$prompt"; echo "Non-interactive terminal: defaulting to 'No'"; return 1; fi
+  local sel=0 key
+  tput civis 2>/dev/null || true
   while true; do
-    printf "%s [y/N]: " "$prompt" >&3
-    if ! IFS= read -r -u 3 answer; then
-      # read failed (EOF), treat as No
-      answer=""
-    fi
-    # normalize to lower-case
-    case "${answer,,}" in
-      y|yes)
-        # close fd and return success
-        if [[ $fd_opened -eq 3 ]]; then exec 3>&- 2>/dev/null || true; fi
-        return 0
-        ;;
-      n|no|"")
-        if [[ $fd_opened -eq 3 ]]; then exec 3>&- 2>/dev/null || true; fi
-        return 1
-        ;;
-      *)
-        printf "Please answer 'y' or 'n'.\n" >&3
-        ;;
+    printf '\r\033[K'
+    if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
+    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
+    IFS= read -rsn1 key 2>/dev/null || key=''
+    if [[ $key == $'\x1b' ]]; then IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''; key+="$rest"; fi
+    case "$key" in
+      $'\n'|$'\r'|'') printf "\n"; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && return 0 || return 1 ;;
+      $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
+      h|H|l|L) sel=$((1 - sel)) ;;
+      q|Q) printf "\n"; echo -e "${RED}Aborted by user.${RESET}"; tput cnorm 2>/dev/null || true; exit 1 ;;
+      *) ;;
     esac
   done
 }
@@ -158,8 +133,6 @@ perform_action(){
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
   log_command_to_file_only "INFO" "Planned command" "$cmd"
-
-  # Prompt the user (will block waiting for response when run interactively)
   if choose_yes_no "Apply?"; then
     if [[ "${DRY_RUN}" == "true" ]]; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been applied (dry-run)" "${RESET}"
@@ -319,8 +292,7 @@ configure_postfix(){
   perform_action "Set Postfix: smtpd_tls_auth_only = yes" "postconf -e 'smtpd_tls_auth_only = yes'"
   perform_action "Set Postfix: smtpd_tls_security_level = may" "postconf -e 'smtpd_tls_security_level = may'"
   perform_action "Set Postfix: smtpd_sasl_auth_enable = yes" "postconf -e 'smtpd_sasl_auth_enable = yes'"
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix || true"
-  else perform_action "Restart Postfix via service" "service postfix restart || true"; fi
+  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart"; fi
 }
 
 configure_exim(){
@@ -345,7 +317,7 @@ configure_exim(){
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding without config edits"; fi
+    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"; fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
@@ -367,7 +339,7 @@ configure_exim(){
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; find '$exim_conf' -type f -name '*.conf' -exec sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/ d' {} + || true"
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
       local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
@@ -466,7 +438,7 @@ echo -e ""
 
   case "$mail_svc" in
     exim)
-      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tas[...]
+      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."
       else log_info "Exim detected — running Exim-specific tasks."; fi
       configure_exim; test_configuration
       ;;
