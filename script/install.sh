@@ -54,14 +54,18 @@ err()    { echo -e "${RED}[ERR]${NC} $*"; }
 # 1) /dev/tty
 # 2) SUDO_TTY (if set)
 # 3) don't open anything (we will only use stdin if it's a real tty)
+# Implementation note:
+# Previously this function required a non-blocking read probe to mark fd3 usable.
+# That probe caused failures in some sudo/piped environments. Now we treat a successful
+# exec 3<... as sufficient to indicate a usable terminal fd.
 USE_TTY_FD=false
 try_open_tty() {
     # close previous fd3 if any
     exec 3<&- 2>/dev/null || true
 
     if [[ -r /dev/tty ]]; then
-        exec 3</dev/tty 2>/dev/null || true
-        if read -t 0 -u 3 >/dev/null 2>&1; then
+        # If we can open /dev/tty for read, treat that as a usable terminal input fd.
+        if exec 3</dev/tty 2>/dev/null; then
             USE_TTY_FD=true
             return 0
         else
@@ -70,8 +74,7 @@ try_open_tty() {
     fi
 
     if [[ -n "${SUDO_TTY:-}" && -r "${SUDO_TTY}" ]]; then
-        exec 3<"${SUDO_TTY}" 2>/dev/null || true
-        if read -t 0 -u 3 >/dev/null 2>&1; then
+        if exec 3<"${SUDO_TTY}" 2>/dev/null; then
             USE_TTY_FD=true
             return 0
         else
@@ -87,6 +90,7 @@ try_open_tty() {
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
+        # read from fd3 (blocking). This allows interactive menus even when stdin is not a tty.
         IFS= read -rsn1 key <&3 2>/dev/null || key=''
         if [[ $key == $'\x1b' ]]; then
             IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || rest=''
@@ -201,7 +205,7 @@ debug_dump
 CAN_MENU=false
 if [[ "$FORCE_MENU" == true ]]; then
     CAN_MENU=true
-elif { [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] && [[ -t 1 ]] ); } && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; then
+elif [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] && [[ -t 1 ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]] ); then
     CAN_MENU=true
 fi
 
