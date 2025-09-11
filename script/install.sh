@@ -1,9 +1,7 @@
 #!/bin/bash
 #
 # LinkZero installer — interactive menu with improved tty detection
-#
-# Test: run 'sudo bash script/install.sh' (or download and run) to see Uninstall preselected when
-#       the script is already installed at /usr/local/bin/linkzero-smtp.
+# Adds numeric-input fallback to main menu so users can type 1/2/3 if single-key reads fail.
 #
 set -euo pipefail
 
@@ -54,17 +52,12 @@ err()    { echo -e "${RED}[ERR]${NC} $*"; }
 # 1) /dev/tty
 # 2) SUDO_TTY (if set)
 # 3) don't open anything (we will only use stdin if it's a real tty)
-# Implementation note:
-# Previously this function required a non-blocking read probe to mark fd3 usable.
-# That probe caused failures in some sudo/piped environments. Now we treat a successful
-# exec 3<... as sufficient to indicate a usable terminal fd.
 USE_TTY_FD=false
 try_open_tty() {
     # close previous fd3 if any
     exec 3<&- 2>/dev/null || true
 
     if [[ -r /dev/tty ]]; then
-        # If we can open /dev/tty for read, treat that as a usable terminal input fd.
         if exec 3</dev/tty 2>/dev/null; then
             USE_TTY_FD=true
             return 0
@@ -90,14 +83,12 @@ try_open_tty() {
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
-        # read from fd3 (blocking). This allows interactive menus even when stdin is not a tty.
         IFS= read -rsn1 key <&3 2>/dev/null || key=''
         if [[ $key == $'\x1b' ]]; then
             IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || rest=''
             key+="$rest"
         fi
     else
-        # only read from stdin if stdin is tty
         if [[ -t 0 ]]; then
             IFS= read -rsn1 key 2>/dev/null || key=''
             if [[ $key == $'\x1b' ]]; then
@@ -108,6 +99,41 @@ read_key() {
             key=''
         fi
     fi
+}
+
+# Attempt to read a numeric menu choice from the user when single-key read fails.
+# Returns selected number in the global variable "numeric_choice" (1-based).
+numeric_choice=""
+prompt_numeric_choice() {
+    numeric_choice=""
+    # Ensure we have a tty if possible
+    try_open_tty || true
+
+    local out="/dev/stdout"
+    local in_fd="/dev/tty"
+    if [[ "$USE_TTY_FD" == true ]]; then
+        in_fd="/dev/fd/3"
+        out="/dev/tty"
+    elif [[ -r /dev/tty ]]; then
+        in_fd="/dev/tty"
+        out="/dev/tty"
+    elif [[ -t 0 ]]; then
+        in_fd="/dev/stdin"
+        out="/dev/stdout"
+    else
+        # no terminal available
+        return 1
+    fi
+
+    printf "No single-key input detected. Enter number (1=Install,2=Uninstall,3=Exit) [default=1]: " >"$out"
+    IFS= read -r choice <"$in_fd" 2>/dev/null || choice=""
+    choice="${choice%%[[:space:]]*}"
+    case "$choice" in
+        1|"" ) numeric_choice=1 ; return 0 ;;
+        2) numeric_choice=2 ; return 0 ;;
+        3|q|Q) numeric_choice=3 ; return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # parse args
@@ -220,8 +246,6 @@ fi
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 
 # Preselect Uninstall if the script appears already installed.
-# This improves UX: users who already have LinkZero installed are likely trying to uninstall.
-# Override: use --install or --uninstall flags, or --interactive to force the menu.
 if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
     sel=1
 else
@@ -243,22 +267,30 @@ while true; do
 
     read_key
 
-    # if read_key produced empty key, bail to non-interactive
+    # If read_key produced empty key, try numeric-line fallback before bailing.
     if [[ -z "$key" ]]; then
-        warn "No interactive input read; falling back to non-interactive install."
-        tput cnorm 2>/dev/null || true
-        exec 3<&- 2>/dev/null || true
-        install_action
-        exit 0
+        if prompt_numeric_choice; then
+            case "$numeric_choice" in
+                1) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+                2) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+                3) echo "Exit."; exec 3<&- 2>/dev/null || true; exit 0 ;;
+            esac
+        else
+            warn "No interactive input read; falling back to non-interactive install."
+            tput cnorm 2>/dev/null || true
+            exec 3<&- 2>/dev/null || true
+            install_action
+            exit 0
+        fi
     fi
 
     case "$key" in
         $'\n'|$'\r')
             tput cnorm 2>/dev/null || true
             case $sel in
-                0) exec 3<&- 2>/dev/null || true; install_action; exit 0 ;;
-                1) exec 3<&- 2>/dev/null || true; uninstall_action; exit 0 ;;
-                2) exec 3<&- 2>/dev/null || true; echo "Exit."; exit 0 ;;
+                0) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+                1) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+                2) echo "Exit."; exec 3<&- 2>/dev/null || true; exit 0 ;;
             esac
             ;;
         $'\x1b[A'|$'\x1b[D')
