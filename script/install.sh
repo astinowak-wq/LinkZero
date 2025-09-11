@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# LinkZero Installation Script (tty-on-fd3 fix) - corrected conditional tests
+# LinkZero Installation Script (fixed conditional errors)
+# Robust interactive menu when piped into sudo bash.
 #
 set -euo pipefail
 
@@ -23,13 +24,14 @@ FORCE=false
 ACTION=""   # will be "install" or "uninstall" or empty
 YES=false
 
+# DEBUG mode when DEBUG=1 in environment
 DEBUG="${DEBUG:-}"
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 
-# open /dev/tty on fd 3 if possible
+# --- open /dev/tty on fd 3 if possible (one-time) ---
 USE_TTY_FD=false
 if [[ -r /dev/tty ]]; then
     exec 3</dev/tty 2>/dev/null || true
@@ -51,6 +53,7 @@ if [[ -n "$DEBUG" ]]; then
       "${TERM:-}"
 fi
 
+# read single key (escape sequences) using fd3 when available
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
@@ -68,11 +71,13 @@ read_key() {
     fi
 }
 
+# ensure running as root
 if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
     exit 1
 fi
 
+# parse args
 for arg in "$@"; do
     case "$arg" in
         --uninstall|-u) ACTION="uninstall" ;;
@@ -84,8 +89,10 @@ for arg in "$@"; do
     esac
 done
 
+# clear screen if stdout is a TTY
 if [[ -t 1 ]]; then clear; fi
 
+# header / logo
 echo -e "${GREEN}"
 echo -e "   █████  █   █  █████        █      █        █   "
 echo -e "  █     █ █   █    █          █               █  █"
@@ -154,33 +161,36 @@ uninstall_action() {
         return 0
     fi
 
-    if [[ "$YES" != true && ( -t 0 || "$USE_TTY_FD" == true ) ]]; then
-        echo ""
-        echo "Confirm removal:"
-        local opt_sel=0
-        local opts=("Remove" "Cancel")
-        tput civis 2>/dev/null || true
-        while true; do
-            printf "\r\033[K"
-            for i in "${!opts[@]}"; do
-                if [[ $i -eq $opt_sel ]]; then
-                    printf "  \033[7m%s\033[0m" "${opts[$i]}"
-                else
-                    printf "  %s" "${opts[$i]}"
-                fi
+    # interactive confirmation only when YES not passed and input is available
+    if [[ "$YES" != true ]]; then
+        if [[ -t 0 ]] || [[ "$USE_TTY_FD" == true ]]; then
+            echo ""
+            echo "Confirm removal:"
+            local opt_sel=0
+            local opts=("Remove" "Cancel")
+            tput civis 2>/dev/null || true
+            while true; do
+                printf "\r\033[K"
+                for i in "${!opts[@]}"; do
+                    if [[ $i -eq $opt_sel ]]; then
+                        printf "  \033[7m%s\033[0m" "${opts[$i]}"
+                    else
+                        printf "  %s" "${opts[$i]}"
+                    fi
+                done
+                read_key
+                case "$key" in
+                    $'\n'|$'\r') printf "\n"; break ;;
+                    $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
+                    $'\x1b[D'|$'\x1b[A') opt_sel=$(( (opt_sel-1 + ${#opts[@]}) % ${#opts[@]} )) ;;
+                    *) ;; 
+                esac
             done
-            read_key
-            case "$key" in
-                $'\n'|$'\r') printf "\n"; break ;;
-                $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
-                $'\x1b[D'|$'\x1b[A') opt_sel=$(( (opt_sel-1 + ${#opts[@]}) % ${#opts[@]} )) ;;
-                *) ;;
-            esac
-        done
-        tput cnorm 2>/dev/null || true
-        if [[ $opt_sel -ne 0 ]]; then
-            log_info "Abort: uninstall cancelled by user"
-            return 0
+            tput cnorm 2>/dev/null || true
+            if [[ $opt_sel -ne 0 ]]; then
+                log_info "Abort: uninstall cancelled by user"
+                return 0
+            fi
         fi
     fi
 
@@ -196,7 +206,7 @@ uninstall_action() {
             rm -f /var/log/linkzero-smtp-security.log || true
             log_info "Removed /var/log/linkzero-smtp-security.log"
         else
-            if [[ -t 0 || "$USE_TTY_FD" == true ]]; then
+            if [[ -t 0 ]] || [[ "$USE_TTY_FD" == true ]]; then
                 echo ""
                 echo "Remove log file /var/log/linkzero-smtp-security.log?"
                 local opt_sel=0
@@ -233,6 +243,7 @@ uninstall_action() {
     log_info "Uninstall complete."
 }
 
+# If action provided via flags, skip interactive selection
 if [[ -n "$ACTION" ]]; then
     case "$ACTION" in
         install) install_action ;;
@@ -243,8 +254,15 @@ if [[ -n "$ACTION" ]]; then
     exit 0
 fi
 
-# Fixed conditional: wrap -z tests in [[ ... ]]
-if { [[ -t 1 || "$USE_TTY_FD" == true ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; }; then
+# Decide whether to show interactive menu in a safe, explicit way (no stray -z)
+SHOW_MENU=false
+if [[ -t 1 ]] || [[ "$USE_TTY_FD" == true ]]; then
+    if [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; then
+        SHOW_MENU=true
+    fi
+fi
+
+if [[ "$SHOW_MENU" == true ]]; then
     options=("Install LinkZero" "Uninstall LinkZero" "Exit")
     sel=0
     tput civis 2>/dev/null || true
@@ -278,6 +296,7 @@ else
     install_action
 fi
 
+# close fd 3 if open
 exec 3<&- 2>/dev/null || true
 
 exit 0
