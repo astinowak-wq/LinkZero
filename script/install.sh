@@ -3,7 +3,7 @@
 # LinkZero installer — numeric-menu main menu + pre-autostart numeric menu
 #
 # Uses line-based numeric input for the main menu (1/2/3) and pre-autostart (1-4).
-# Uninstall now always removes the installed file without any interactive confirmation.
+# Uninstall removes the installed file without confirmation and then returns to the main menu.
 #
 set -euo pipefail
 
@@ -90,7 +90,9 @@ open_io() {
     OUTPUT_PATH="/dev/stdout"
 
     if [[ "$USE_TTY_FD" == true ]]; then
+        # fd3 is open for read
         INPUT_FD="/dev/fd/3"
+        # prefer /dev/tty for output so prompts are visible even if stdout is redirected
         if [[ -w /dev/tty ]]; then
             OUTPUT_PATH="/dev/tty"
         else
@@ -170,6 +172,7 @@ choose_prelaunch_mode() {
     open_io
 
     if [[ -z "$INPUT_FD" ]]; then
+        # no interactive input — default to launch
         printf "launch"
         return 0
     fi
@@ -229,6 +232,7 @@ countdown_and_apply_mode() {
                 return 0
             fi
             printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$out"
+            # attach to terminal if possible
             if [[ -w /dev/tty ]]; then
                 exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty
             else
@@ -258,9 +262,11 @@ install_action() {
     chmod +x "$install_path"
     log "Installed to $install_path"
 
+    # show the separate pre-autostart numeric menu
     try_open_tty || true
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
+    # If user selected dry, remove the file before countdown/launch
     if [[ "$chosen_mode" == "dry" ]]; then
         rm -f "$install_path" || true
     fi
@@ -306,56 +312,58 @@ if [[ "$CAN_MENU" != true ]]; then
     exit 0
 fi
 
-# Numeric-style interactive main menu
+# Numeric-style interactive main menu loop
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 
-# Preselect default choice
-if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
-    default_choice=2
-else
-    default_choice=1
-fi
+while true; do
+    # Determine default based on presence of installed file
+    if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
+        default_choice=2
+    else
+        default_choice=1
+    fi
 
-try_open_tty || true
-open_io
+    try_open_tty || true
+    open_io
 
-printf "\n"
-printf "Use numeric menu to choose an action:\n" >"$OUTPUT_PATH"
-for i in "${!options[@]}"; do
-    printf "  %d) %s\n" $((i+1)) "${options[$i]}" >"$OUTPUT_PATH"
+    printf "\n" >"$OUTPUT_PATH"
+    printf "Use numeric menu to choose an action:\n" >"$OUTPUT_PATH"
+    for i in "${!options[@]}"; do
+        printf "  %d) %s\n" $((i+1)) "${options[$i]}" >"$OUTPUT_PATH"
+    done
+
+    # Prompt for selection
+    read_line selection "Choose [1-3] (default=${default_choice}): "
+    selection="${selection%%[[:space:]]*}"
+
+    if [[ -z "$selection" ]]; then
+        selection="$default_choice"
+    fi
+
+    case "$selection" in
+        1)
+            install_action
+            # After install, exit the installer run (preserves original behavior)
+            exec 3<&- 2>/dev/null || true
+            exit 0
+            ;;
+        2)
+            uninstall_action
+            # After uninstall, return to top of the loop so the user can choose again
+            continue
+            ;;
+        3|q|Q)
+            echo "Exit." >"$OUTPUT_PATH"
+            exec 3<&- 2>/dev/null || true
+            exit 0
+            ;;
+        *)
+            warn "Invalid selection; try again."
+            continue
+            ;;
+    esac
 done
 
-# Prompt for selection
-read_line selection "Choose [1-3] (default=${default_choice}): "
-selection="${selection%%[[:space:]]*}"
-
-if [[ -z "$selection" ]]; then
-    selection="$default_choice"
-fi
-
-case "$selection" in
-    1)
-        install_action
-        exec 3<&- 2>/dev/null || true
-        exit 0
-        ;;
-    2)
-        uninstall_action
-        exec 3<&- 2>/dev/null || true
-        exit 0
-        ;;
-    3|q|Q)
-        echo "Exit." >"$OUTPUT_PATH"
-        exec 3<&- 2>/dev/null || true
-        exit 0
-        ;;
-    *)
-        warn "Invalid selection; exiting."
-        exec 3<&- 2>/dev/null || true
-        exit 1
-        ;;
-esac
-
-# close fd 3
+# close fd 3 (should be unreachable, but keep for completeness)
 exec 3<&- 2>/dev/null || true
 exit 0
