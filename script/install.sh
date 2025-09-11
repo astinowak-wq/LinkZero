@@ -2,10 +2,8 @@
 #
 # LinkZero installer — numeric-menu main menu + pre-autostart numeric menu
 #
-# This version uses line-based numeric input for the main menu (1/2/3)
-# and for the pre-autostart choices (1-4). It prefers /dev/fd/3 (opened
-# by try_open_tty), then /dev/tty, then stdin when available. This avoids
-# single-key read issues and works under sudo when a tty is available.
+# Uses line-based numeric input for the main menu (1/2/3) and pre-autostart (1-4).
+# Uninstall now always removes the installed file without any interactive confirmation.
 #
 set -euo pipefail
 
@@ -92,9 +90,7 @@ open_io() {
     OUTPUT_PATH="/dev/stdout"
 
     if [[ "$USE_TTY_FD" == true ]]; then
-        # fd3 is open for read
         INPUT_FD="/dev/fd/3"
-        # prefer /dev/tty for output so prompts are visible even if stdout is redirected
         if [[ -w /dev/tty ]]; then
             OUTPUT_PATH="/dev/tty"
         else
@@ -123,7 +119,6 @@ read_line() {
     if [[ -n "$INPUT_FD" ]]; then
         IFS= read -r line <"$INPUT_FD" 2>/dev/null || line=""
     else
-        # no input available
         line=""
     fi
     printf -v "$__var" "%s" "$line"
@@ -175,7 +170,6 @@ choose_prelaunch_mode() {
     open_io
 
     if [[ -z "$INPUT_FD" ]]; then
-        # no interactive input — default to launch
         printf "launch"
         return 0
     fi
@@ -235,7 +229,6 @@ countdown_and_apply_mode() {
                 return 0
             fi
             printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$out"
-            # attach to terminal if possible
             if [[ -w /dev/tty ]]; then
                 exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty
             else
@@ -265,11 +258,9 @@ install_action() {
     chmod +x "$install_path"
     log "Installed to $install_path"
 
-    # show the separate pre-autostart numeric menu
     try_open_tty || true
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
-    # If user selected dry, remove the file before countdown/launch
     if [[ "$chosen_mode" == "dry" ]]; then
         rm -f "$install_path" || true
     fi
@@ -283,7 +274,7 @@ uninstall_action() {
         return 0
     fi
 
-    # No interactive confirmation — always remove when uninstall_action is called.
+    # Uninstall: no confirmation, just remove
     rm -f "$install_path" && log "Removed $install_path"
 }
 
@@ -318,7 +309,7 @@ fi
 # Numeric-style interactive main menu
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 
-# Preselect Uninstall if the script appears already installed.
+# Preselect default choice
 if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
     default_choice=2
 else
