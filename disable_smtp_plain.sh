@@ -4,14 +4,14 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Changes in this revision:
-# - Terminal output will never show the actual command text. Any place that
-#   previously printed command text to the terminal (e.g. "Planned command for action: ...")
-#   now prints a redacted placeholder "[command hidden]" while the full command is still
-#   written to the logfile for auditing.
-# - Implemented a log_cmd helper that writes the full message+command to the logfile
-#   but prints a redacted version to interactive terminals. Non-interactive output
-#   still shows full timestamped lines.
+# Revision notes:
+# - Planned/command-related INFO lines that are associated with the interactive
+#   yes/no prompt are no longer printed to the terminal. They are still written
+#   to the logfile for auditing.
+# - The interactive UI still shows the Action prompt and the green/red result
+#   messages, but it does not show any "[INFO] ... Planned command ..." or
+#   similar lines. Other non-command INFO messages (e.g. "Detected firewall manager")
+#   continue to be printed.
 #
 set -euo pipefail
 
@@ -55,27 +55,37 @@ filter_out_timestamp_lines() {
   done
 }
 
+# Write a timestamped entry to logfile (always). Best-effort: do not fail if write fails.
+log_to_file() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
 # Standard logger for simple messages (no commands). Keeps timestamps in logfile,
 # and prints clean level-prefixed lines to interactive terminal.
 log() {
   local level="$1"; shift
   local msg="$*"
-  local ts
-  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  log_to_file "$level" "$msg"
 
   if [[ "${DRY_RUN}" == "true" ]]; then
     if [[ -t 1 ]]; then
       printf '[%s] %s\n' "$level" "$msg"
     else
+      # non-interactive: include timestamp for readability
+      local ts
+      ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
     fi
   else
-    # write timestamped entry to logfile
-    printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
-
     if [[ -t 1 ]]; then
       printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
     else
+      local ts
+      ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
     fi
   fi
@@ -84,35 +94,17 @@ log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
-# New helper: log a message that includes a command.
-# - Writes the full timestamped message including the real command to the logfile.
-# - Prints a redacted message to interactive terminals (command replaced with "[command hidden]").
-# - For non-interactive output prints the full timestamped line (so automation/redirects retain full info).
-log_cmd() {
+# Helper that records a message including a command to the logfile only, but
+# does NOT print that line to the terminal.
+# Use this for any "Planned command", "DRY-RUN: would run", "User rejected action" that would
+# otherwise produce an [INFO] line containing the command. Auditability preserved (logfile),
+# terminal remains silent for those lines.
+log_command_to_file_only() {
   local level="$1"; shift
   local msg="$1"; shift
   local cmd="$*"
-  local ts
-  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
-  # Append full info to logfile (best-effort)
-  printf '%s [%s] %s: %s\n' "$ts" "$level" "$msg" "$cmd" >> "$LOG_FILE" 2>/dev/null || true
-
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    if [[ -t 1 ]]; then
-      printf '[%s] %s: %s\n' "$level" "$msg" "[command hidden]"
-    else
-      printf '%s [%s] %s: %s\n' "$ts" "$level" "$msg" "$cmd"
-    fi
-  else
-    if [[ -t 1 ]]; then
-      # interactive -> hide the actual command text
-      printf '[%s] %s: %s\n' "$level" "$msg" "[command hidden]" | filter_out_timestamp_lines
-    else
-      # non-interactive -> show full timestamped line
-      printf '%s [%s] %s: %s\n' "$ts" "$level" "$msg" "$cmd"
-    fi
-  fi
+  log_to_file "$level" "$msg: $cmd"
+  # deliberately do not emit anything to stdout/stderr here
 }
 
 # Robust CSF presence check.
@@ -365,6 +357,7 @@ choose_yes_no() {
 # perform_action "Description" "command string"
 # - prompts Yes/No with choose_yes_no
 # - in dry-run will never execute the command even if the user picks Yes
+# Important: do NOT print INFO lines that contain the actual command text to terminal.
 perform_action(){
   local desc="$1"; shift
   local cmd="$*"
@@ -375,20 +368,22 @@ perform_action(){
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
 
-  # log planned command, but print only redacted form to terminal
-  log_cmd "INFO" "Planned command for action" "$cmd"
+  # Record the planned command in logfile only; do not print "[INFO] Planned command...." to terminal.
+  log_command_to_file_only "INFO" "Planned command for action" "$cmd"
 
   if choose_yes_no "Apply?"; then
     # User answered YES
     if [[ "${DRY_RUN}" == "true" ]]; then
+      # Inform the user in green, but do not display the command text in terminal.
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
-      # record dry-run intention in logfile with full command, but redact on terminal
-      log_cmd "INFO" "DRY-RUN: would run" "$cmd"
+      # Record the dry-run intention in logfile only.
+      log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"
       return 0
     fi
 
-    # Attempt execution (no command echoed to terminal)
+    # Attempt execution (no command echoed to terminal). Record execution attempt in logfile.
+    log_command_to_file_only "INFO" "Executing command for action" "$cmd"
     if eval "$cmd"; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
       log_success "$desc"
@@ -404,8 +399,8 @@ perform_action(){
     # User answered NO -> show rejection message in red (no "Skipped:" line)
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped")
-    # log rejection, but redact the command in terminal output
-    log_cmd "INFO" "User rejected action: $desc" "$cmd"
+    # Log the rejection and the full command only to logfile (do not print it to terminal).
+    log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"
     return 0
   fi
 }
