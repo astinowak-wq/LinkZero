@@ -14,46 +14,10 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 ORANGE='\033[0;33m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
 
-# Clear the screen and print the header when stdout is a terminal.
-if [[ -t 1 ]]; then
-    clear
-fi
-
-echo -e "${GREEN}"
-echo -e "   █████  █   █  █████        █      █        █   "
-echo -e "  █     █ █   █    █          █               █  █"
-echo -e "  █     █ █   █    █          █      █  █     █ █ "
-echo -e "  █     █ █████    █          █      █  ████  ██  "
-echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
-echo -e "   █████  █   █    █          █████  █  █   █ █  █"
-echo -e "${NC}"
-echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
-echo -e "${BLUE}========================================================"
-echo -e "        QHTL Zero Configurator SMTP Hardening    "
-echo -e "========================================================${NC}"
-echo ""
-
-# Config
-SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable_smtp_plain.sh"
-INSTALL_DIR="/usr/local/bin"
-SCRIPT_NAME="linkzero-smtp"
-
-# State flags
-ACTION=""
-YES=false
-FORCE=false
-FORCE_MENU=false
-DEBUG="${DEBUG:-}"
-
-log()    { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()   { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()    { echo -e "${RED}[ERR]${NC} $*"; }
-
-# Try to open a terminal on fd 3. Order:
-# 1) /dev/tty
-# 2) SUDO_TTY (if set)
-# 3) don't open anything (we will only use stdin if it's a real tty)
+# Try to open a terminal on fd 3 early so we can reliably query cursor position.
 USE_TTY_FD=false
 try_open_tty() {
     # close previous fd3 if any
@@ -81,7 +45,7 @@ try_open_tty() {
     return 1
 }
 
-# Determine input/output paths to use for line-based prompts.
+# Determine input/output paths to use for line-based prompts and header drawing.
 INPUT_FD=""
 OUTPUT_PATH=""
 open_io() {
@@ -109,6 +73,160 @@ open_io() {
         OUTPUT_PATH="/dev/stdout"
     fi
 }
+
+# Query the terminal for current cursor position. Requires INPUT_FD (readable) and OUTPUT_PATH (writable).
+# Returns "row;col" on stdout, or empty / non-zero on failure.
+get_cursor_pos() {
+    if [[ -z "$INPUT_FD" || -z "$OUTPUT_PATH" ]]; then
+        return 1
+    fi
+    local oldstty
+    oldstty=$(stty -g <"$INPUT_FD" 2>/dev/null || true)
+    stty raw -echo <"$INPUT_FD" 2>/dev/null || true
+    printf '\033[6n' >"$OUTPUT_PATH" 2>/dev/null
+    local response
+    IFS=';' read -r -d R response <"$INPUT_FD" 2>/dev/null || true
+    if [[ -n "$oldstty" ]]; then
+        stty "$oldstty" <"$INPUT_FD" 2>/dev/null || true
+    fi
+    response="${response#*[}"
+    local row="${response%%;*}"
+    local col="${response#*;}"
+    if [[ -n "$row" && -n "$col" ]]; then
+        printf "%s;%s" "$row" "$col"
+        return 0
+    fi
+    return 1
+}
+
+# Header block lines (exact content used in your original header)
+HEADER_LINES=(
+"   █████  █   █  █████        █      █        █   "
+"  █     █ █   █    █          █               █  █"
+"  █     █ █   █    █          █      █  █     █ █ "
+"  █     █ █████    █          █      █  ████  ██  "
+"  █     █ █   █    █          █      █  █   █ █ █ "
+"   █████  █   █    █          █████  █  █   █ █  █"
+""
+" a u t h o r :    D A N I E L    N O W A K O W S K I"
+"========================================================"
+"        QHTL Zero Configurator SMTP Hardening    "
+"========================================================"
+""
+)
+
+ANIM_PID=""
+HEADER_TOP_ROW=1
+HEADER_COL=1
+
+# Draw the header block at absolute position HEADER_TOP_ROW,HEADER_COL with the provided color.
+_print_header_with_color() {
+    local color="$1"
+    local out="${OUTPUT_PATH:-/dev/stdout}"
+    # move to absolute top-left of header
+    printf '\033[%s;%sH' "$HEADER_TOP_ROW" "$HEADER_COL" >"$out" 2>/dev/null || true
+    for line in "${HEADER_LINES[@]}"; do
+        if [[ "$line" == " a u t h o r :"* ]]; then
+            printf "%b%s%b\n" "$color$BOLD" "$line" "$NC" >"$out" 2>/dev/null || true
+        else
+            printf "%b%s%b\n" "$color" "$line" "$NC" >"$out" 2>/dev/null || true
+        fi
+    done
+}
+
+# Animate the header block by cycling colors, redrawing the block in-place.
+animate_header() {
+    local colors=("$RED" "$ORANGE" "$YELLOW" "$GREEN" "$CYAN" "$BLUE" "$MAGENTA")
+    local idx=0
+    local out="${OUTPUT_PATH:-/dev/stdout}"
+    # hide cursor while animating
+    printf '\033[?25l' >"$out" 2>/dev/null || true
+    while true; do
+        local color="${colors[$((idx % ${#colors[@]}))]}"
+        # save cursor, draw header, restore cursor
+        printf '\033[s' >"$out" 2>/dev/null || true
+        _print_header_with_color "$color"
+        printf '\033[u' >"$out" 2>/dev/null || true
+        sleep 0.12
+        idx=$((idx+1))
+    done
+}
+
+kill_header_animator() {
+    try_open_tty || true
+    open_io || true
+    if [[ -n "${ANIM_PID:-}" ]]; then
+        kill "${ANIM_PID}" 2>/dev/null || true
+        wait "${ANIM_PID}" 2>/dev/null || true
+        ANIM_PID=""
+    fi
+    # show cursor again
+    local out="${OUTPUT_PATH:-/dev/stdout}"
+    printf '\033[?25h' >"$out" 2>/dev/null || true
+}
+
+# Clear the screen when stdout is a terminal.
+if [[ -t 1 ]]; then
+    clear
+fi
+
+# Prepare tty IO and print header (either static or animated)
+try_open_tty || true
+open_io
+out="$OUTPUT_PATH"
+
+if [[ "$USE_TTY_FD" != true ]]; then
+    # No tty: print header once in original colors (fallback)
+    printf "%b\n" "${GREEN}" >"$out" 2>/dev/null || true
+    for line in "${HEADER_LINES[@]}"; do
+        if [[ "$line" == " a u t h o r :"* ]]; then
+            printf "%b%s%b\n" "${RED}${BOLD}" "$line" "${NC}" >"$out" 2>/dev/null || true
+        else
+            printf "%s\n" "$line" >"$out" 2>/dev/null || true
+        fi
+    done
+else
+    # Print header block once (plain) to establish screen content, then probe cursor to compute top row.
+    for line in "${HEADER_LINES[@]}"; do
+        printf "%s\n" "$line" >"$out" 2>/dev/null || true
+    done
+
+    # Query cursor position (cursor now on the line after header block)
+    pos="$(get_cursor_pos)" || true
+    if [[ -n "$pos" ]]; then
+        local r="${pos%;*}"
+        HEADER_TOP_ROW=$((r - ${#HEADER_LINES[@]}))
+        HEADER_COL=1
+        # start background animator that will overwrite the printed header in-place
+        animate_header >/dev/null 2>&1 &
+        ANIM_PID=$!
+        # ensure animator is killed and cursor restored on exit
+        trap 'kill_header_animator' EXIT
+    else
+        # If probing failed, draw once in green
+        HEADER_TOP_ROW=1
+        _print_header_with_color "$GREEN"
+    fi
+fi
+
+# Print a blank line after header area (matches original layout)
+printf "\n" >"$out" 2>/dev/null || true
+
+# Config
+SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable_smtp_plain.sh"
+INSTALL_DIR="/usr/local/bin"
+SCRIPT_NAME="linkzero-smtp"
+
+# State flags
+ACTION=""
+YES=false
+FORCE=false
+FORCE_MENU=false
+DEBUG="${DEBUG:-}"
+
+log()    { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()   { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()    { echo -e "${RED}[ERR]${NC} $*"; }
 
 # Read a line from chosen input fd into variable named by first arg.
 # Usage: read_line varname "prompt text"
@@ -294,8 +412,8 @@ if [[ -n "$ACTION" ]]; then
     try_open_tty || true
     debug_dump
     case "$ACTION" in
-        install) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
-        uninstall) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+        install) install_action; kill_header_animator; exec 3<&- 2>/dev/null || true; exit 0 ;;
+        uninstall) uninstall_action; kill_header_animator; exec 3<&- 2>/dev/null || true; exit 0 ;;
     esac
 fi
 
@@ -313,6 +431,7 @@ fi
 if [[ "$CAN_MENU" != true ]]; then
     warn "Interactive menu not available — running non-interactive install."
     install_action
+    kill_header_animator
     exec 3<&- 2>/dev/null || true
     exit 0
 fi
@@ -358,6 +477,7 @@ while true; do
             ;;
         3|q|Q)
             echo "Exit." >"$OUTPUT_PATH"
+            kill_header_animator
             exec 3<&- 2>/dev/null || true
             exit 0
             ;;
@@ -369,5 +489,6 @@ while true; do
 done
 
 # close fd 3 (should be unreachable)
+kill_header_animator
 exec 3<&- 2>/dev/null || true
 exit 0
