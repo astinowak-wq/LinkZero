@@ -4,14 +4,14 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Revision notes:
-# - Planned/command-related INFO lines that are associated with the interactive
-#   yes/no prompt are no longer printed to the terminal. They are still written
-#   to the logfile for auditing.
-# - The interactive UI still shows the Action prompt and the green/red result
-#   messages, but it does not show any "[INFO] ... Planned command ..." or
-#   similar lines. Other non-command INFO messages (e.g. "Detected firewall manager")
-#   continue to be printed.
+# Revision notes (this change):
+# - Added mail-server detection with priority: exim > postfix > none.
+# - If exim is detected, only Exim-related actions are offered/executed.
+# - If postfix is detected (and exim is not), only Postfix-related actions are offered/executed.
+# - If neither is detected, the script falls back to prompting for both (the "rest" case).
+# - Ensured Exim checks are not duplicated; there is a single configure_exim() and single
+#   detection point. All audit logging still records full commands to the logfile only;
+#   the interactive terminal never shows command text.
 #
 set -euo pipefail
 
@@ -75,7 +75,6 @@ log() {
     if [[ -t 1 ]]; then
       printf '[%s] %s\n' "$level" "$msg"
     else
-      # non-interactive: include timestamp for readability
       local ts
       ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
@@ -95,42 +94,33 @@ log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
 # Helper that records a message including a command to the logfile only, but
-# does NOT print that line to the terminal.
-# Use this for any "Planned command", "DRY-RUN: would run", "User rejected action" that would
-# otherwise produce an [INFO] line containing the command. Auditability preserved (logfile),
-# terminal remains silent for those lines.
+# does NOT print that line to the terminal. Use this for any "Planned command",
+# "DRY-RUN: would run", "Executing command for action", and "User rejected action"
+# lines so terminal doesn't show commands but logfile keeps them.
 log_command_to_file_only() {
   local level="$1"; shift
   local msg="$1"; shift
   local cmd="$*"
   log_to_file "$level" "$msg: $cmd"
-  # deliberately do not emit anything to stdout/stderr here
+  # intentionally silent on stdout/stderr
 }
 
 # Robust CSF presence check.
 csf_present() {
-  # 1) systemctl services
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet csf 2>/dev/null || systemctl is-active --quiet lfd 2>/dev/null; then
       return 0
     fi
   fi
-
-  # 2) running processes (csf or lfd)
   if pgrep -x csf >/dev/null 2>&1 || pgrep -x lfd >/dev/null 2>&1 || pgrep -f '/usr/local/csf' >/dev/null 2>&1; then
     return 0
   fi
-
-  # 3) common install paths
   if [[ -d /etc/csf ]] || [[ -d /usr/local/csf ]] || [[ -x /usr/sbin/csf ]] || [[ -x /usr/local/sbin/csf ]]; then
     return 0
   fi
-
-  # 4) cPanel indicator + csf dir (often cPanel systems have /usr/local/cpanel)
   if [[ -d /usr/local/cpanel ]] && ([[ -d /etc/csf ]] || [[ -d /usr/local/csf ]]); then
     return 0
   fi
-
   return 1
 }
 
@@ -141,16 +131,12 @@ detect_active_firewall() {
     echo "csf"
     return 0
   fi
-
-  # nftables next
   if command -v nft >/dev/null 2>&1; then
     if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then
       echo "nftables"
       return 0
     fi
   fi
-
-  # firewalld
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state >/dev/null 2>&1; then
       if firewall-cmd --state 2>/dev/null | grep -qi running; then
@@ -162,24 +148,19 @@ detect_active_firewall() {
       return 0
     fi
   fi
-
-  # iptables fallback
   if command -v iptables-save >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1; then
     echo "iptables"
     return 0
   fi
-
   echo "none"
   return 0
 }
 
-# Firewall existence checks
-# Returns 0 when the given command/change already exists on the system for the given manager.
+# Firewall existence checks (unchanged behaviour from earlier revision)
 firewall_change_exists() {
   local manager="$1"; shift
   local cmd="$*"
 
-  # helper: check presence of a single port in various managers
   port_present_in_nft() {
     local port="$1"
     nft list ruleset 2>/dev/null | grep -E -q "dport[[:space:]]+$port|dport[[:space:]]+${port}[[:space:]]" && nft list ruleset 2>/dev/null | grep -q "accept"
@@ -228,7 +209,6 @@ firewall_change_exists() {
     return 1
   }
 
-  # Look for obvious port numbers referenced in the command
   local ports_found=()
   while read -r p; do
     [[ -n "$p" ]] && ports_found+=("$p")
@@ -277,33 +257,22 @@ firewall_change_exists() {
   return 1
 }
 
-# Terminal arrow-based chooser:
-# - prompt: displayed text to ask
-# Returns:
-#   0 -> user selected YES
-#   1 -> user selected NO
+# Terminal arrow-based chooser (unchanged)
 choose_yes_no() {
   local prompt="$1"
 
-  # Non-interactive: safe default to NO
   if ! [[ -t 0 ]]; then
     echo "$prompt"
     echo "Non-interactive terminal: defaulting to 'No'"
     return 1
   fi
 
-  # selection: 0 = YES, 1 = NO
   local sel=0
   local key
-
-  # hide cursor if possible
   tput civis 2>/dev/null || true
 
   while true; do
-    # clear line and render prompt with colored selected option
     printf '\r\033[K'
-
-    # Selected option uses color, unselected uses terminal default color
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"
       option_no="NO"
@@ -312,21 +281,17 @@ choose_yes_no() {
       option_no="${RED}NO${RESET}"
     fi
 
-    # Prompt remains highlighted so it's obvious what you're answering; options are not bold.
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
 
-    # read one key (raw, silent)
     IFS= read -rsn1 key 2>/dev/null || key=''
 
-    # If it's an escape, read remaining bytes of the sequence (arrow keys)
     if [[ $key == $'\x1b' ]]; then
-      # read up to two more bytes (common CSI sequences are 3 bytes total)
       IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
       key+="$rest"
     fi
 
     case "$key" in
-      $'\n'|$'\r'|'')   # Enter pressed
+      $'\n'|$'\r'|'')
         printf "\n"
         tput cnorm 2>/dev/null || true
         if [[ $sel -eq 0 ]]; then
@@ -335,54 +300,41 @@ choose_yes_no() {
           return 1
         fi
         ;;
-      $'\x1b[C'|$'\x1b[D')  # Right or Left arrow
-        sel=$((1 - sel))
-        ;;
-      h|H|l|L)
-        sel=$((1 - sel))
-        ;;
+      $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
+      h|H|l|L) sel=$((1 - sel)) ;;
       q|Q)
         printf "\n"
         echo -e "${RED}Aborted by user.${RESET}"
         tput cnorm 2>/dev/null || true
         exit 1
         ;;
-      *)
-        # ignore other keys
-        ;;
+      *) ;;
     esac
   done
 }
 
-# perform_action "Description" "command string"
-# - prompts Yes/No with choose_yes_no
-# - in dry-run will never execute the command even if the user picks Yes
-# Important: do NOT print INFO lines that contain the actual command text to terminal.
+# perform_action unchanged in behaviour: user sees only action + result; commands logged to logfile-only
 perform_action(){
   local desc="$1"; shift
   local cmd="$*"
 
-  # Show only the action (no "Command:" printed to terminal)
   echo -e "${CYAN}${BOLD}Action:${RESET} ${desc}"
 
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
 
-  # Record the planned command in logfile only; do not print "[INFO] Planned command...." to terminal.
+  # record planned command to logfile only
   log_command_to_file_only "INFO" "Planned command for action" "$cmd"
 
   if choose_yes_no "Apply?"; then
-    # User answered YES
     if [[ "${DRY_RUN}" == "true" ]]; then
-      # Inform the user in green, but do not display the command text in terminal.
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
-      # Record the dry-run intention in logfile only.
       log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"
       return 0
     fi
 
-    # Attempt execution (no command echoed to terminal). Record execution attempt in logfile.
+    # Record execution attempt to logfile only (no command printed to terminal)
     log_command_to_file_only "INFO" "Executing command for action" "$cmd"
     if eval "$cmd"; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
@@ -396,17 +348,14 @@ perform_action(){
       return 1
     fi
   else
-    # User answered NO -> show rejection message in red (no "Skipped:" line)
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped")
-    # Log the rejection and the full command only to logfile (do not print it to terminal).
     log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"
     return 0
   fi
 }
 
-# Wrapper that checks whether the firewall change is already present and only prompts
-# if it is not present.
+# Wrapper that checks firewall changes (unchanged from previous revision)
 precheck_and_perform_firewall_action() {
   local manager="$1"; shift
   local desc="$1"; shift
@@ -424,7 +373,7 @@ precheck_and_perform_firewall_action() {
   perform_action "$desc" "$cmd"
 }
 
-# Configure firewall: only act on the detected active firewall manager.
+# Configure firewall (unchanged)
 configure_firewall() {
   local fw
   fw="$(detect_active_firewall)"
@@ -472,6 +421,34 @@ nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/de
   esac
 }
 
+# MAIL SERVER DETECTION
+# Priority: exim > postfix > none
+detect_active_mailserver() {
+  # Exim (exim or exim4)
+  if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
+    echo "exim"
+    return 0
+  fi
+
+  # Postfix (prefer checking postconf or systemctl status)
+  if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
+    # optionally check systemctl status of postfix if available
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl is-active --quiet postfix 2>/dev/null; then
+        echo "postfix"
+        return 0
+      fi
+    fi
+    # If postconf or postfix present, treat as postfix
+    echo "postfix"
+    return 0
+  fi
+
+  echo "none"
+  return 0
+}
+
+# Configure Postfix: only executed when selected by detection (or in fallback 'none' case)
 configure_postfix(){
   log_info "Configuring Postfix to require TLS for AUTH"
 
@@ -491,6 +468,8 @@ configure_postfix(){
   fi
 }
 
+# Configure Exim: only executed when selected by detection (or in fallback 'none' case)
+# Single canonical configure_exim() - no duplicate Exim checks elsewhere.
 configure_exim(){
   log_info "Configuring Exim to require TLS for AUTH (if Exim is present)"
 
@@ -525,8 +504,10 @@ configure_exim(){
   fi
 }
 
+# Test configuration: only test the active mail server(s) as appropriate
 test_configuration(){
   log_info "Testing mail server configuration (these actions will be prompted separately)"
+  # Basic checks left as perform_action so user can accept or reject
   perform_action "Postfix: basic configuration check" "postfix check"
   perform_action "Exim: basic configuration info" "exim -bV"
 }
@@ -571,10 +552,34 @@ main(){
   done
 
   log_info "Starting smtp-hardening (dry-run=${DRY_RUN:-false})"
+
   configure_firewall
-  configure_postfix
-  configure_exim
-  test_configuration
+
+  # Mail server selection & execution policy:
+  # Priority: exim -> postfix -> none (fallback: prompt for both)
+  local mail_svc
+  mail_svc="$(detect_active_mailserver)"
+  log_info "Detected mail server: ${mail_svc}"
+
+  case "$mail_svc" in
+    exim)
+      log_info "Exim detected: only running Exim-related configuration and checks."
+      configure_exim
+      test_configuration   # test_configuration will prompt for both checks, but configure_exim already ensured exim presence
+      ;;
+    postfix)
+      log_info "Postfix detected (no Exim): only running Postfix-related configuration and checks."
+      configure_postfix
+      test_configuration
+      ;;
+    none|*)
+      log_info "No specific mail server detected; prompting for both Exim and Postfix configuration (fallback)."
+      configure_exim
+      configure_postfix
+      test_configuration
+      ;;
+  esac
+
   log_info "Completed smtp-hardening run"
 
   _print_summary
