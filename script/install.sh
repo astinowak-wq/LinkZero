@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# LinkZero installer — numbered interactive menu with configurable autostart mode
-# Adds a short interactive menu that appears just before autostart so the user can
-# choose the mode that will be applied immediately (and launched 5 seconds later).
+# LinkZero installer — simplified interactive menu (numbered choices)
+# After successful installation the installed program will be launched
+# automatically after a 5 second orange-coloured countdown (interactive only).
 #
 set -euo pipefail
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
-# "Orange" (best-effort using a yellow tone; 256-color alternative: '\033[38;5;214m')
+# "Orange" (best-effort using a yellow tone; change to 38;5;214m for 256-color orange)
 ORANGE='\033[0;33m'
 
 # Header (show when stdout is a terminal)
@@ -31,14 +31,9 @@ echo ""
 SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable_smtp_plain.sh"
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="linkzero-smtp"
-CONFIG_DIR="/etc/linkzero"
-CONFIG_FILE="$CONFIG_DIR/autostart_mode"
 
-# State flags
-ACTION=""
-YES=false
-FORCE=false
-FORCE_MENU=false
+# Flags
+ACTION=""; YES=false; FORCE=false; FORCE_MENU=false
 DEBUG="${DEBUG:-}"
 
 log(){ echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -68,33 +63,9 @@ download_script_to_temp(){
     fi
 }
 
-# Read autostart mode (sanitized). Returns one of: launch|background|none|dry
-read_autostart_mode(){
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local v
-        v=$(tr -d '\r\n' <"$CONFIG_FILE" 2>/dev/null || true)
-        case "$v" in
-            launch|background|none|dry) printf "%s" "$v"; return 0 ;;
-            *) printf "launch"; return 0 ;;
-        esac
-    fi
-    printf "launch"
-}
-
-# Write autostart mode to CONFIG_FILE; returns 0 on success
-write_autostart_mode(){
-    local mode="$1"
-    case "$mode" in
-        launch|background|none|dry) ;;
-        *) return 1 ;;
-    esac
-    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-    printf "%s\n" "$mode" > "$CONFIG_FILE" || return 1
-    return 0
-}
-
-# Print to /dev/tty when available (so piped runs still show messages)
+# robust helper to print to the user's terminal when available
 _output_dev() {
+    # prefer /dev/tty (works when running via sudo or when script is piped)
     if [[ -r /dev/tty ]]; then
         printf "%b" "$1" > /dev/tty
     else
@@ -102,108 +73,51 @@ _output_dev() {
     fi
 }
 
-# Countdown + launch respects mode
+# robust countdown + launch helper
 countdown_and_launch() {
     local install_path="$1"
-    local mode="$2"
-    local seconds=${3:-5}
+    local seconds=${2:-5}
     local outdev
     if [[ -r /dev/tty ]]; then outdev="/dev/tty"; else outdev="/dev/stdout"; fi
 
-    case "$mode" in
-        dry)
-            printf "%b\n" "${ORANGE}Dry-run mode: installation simulated, program will NOT be launched.${NC}" >"$outdev"
-            return 0
-            ;;
-        none)
-            printf "%b\n" "${ORANGE}Autostart disabled: the installed program will not be launched automatically.${NC}" >"$outdev"
-            return 0
-            ;;
-        background)
-            printf "%b\n" "${ORANGE}Program will be started in background after ${seconds} seconds.${NC}" >"$outdev"
-            ;;
-        launch)
-            printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$outdev"
-            ;;
-        *)
-            printf "%b\n" "${ORANGE}Unknown autostart mode: %s — not launching.${NC}" "$mode" >"$outdev"
-            return 0
-            ;;
-    esac
+    printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$outdev"
 
+    # one-line updating countdown
     for ((i=seconds;i>=1;i--)); do
+        # print with carriage return so it updates on one line
         printf "\r%bStarting in %d... %b" "$ORANGE" "$i" "$NC" >"$outdev"
+        # flush by redirecting nothing; sleep does implicit flush
         sleep 1
     done
     printf "\n" >"$outdev"
 
-    if [[ ! -x "$install_path" ]]; then
-        printf "%b\n" "${YELLOW}Installed file not executable or missing: ${install_path}${NC}" >"$outdev"
-        return 0
-    fi
+    if [[ -x "$install_path" ]]; then
+        printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$outdev"
 
-    case "$mode" in
-        launch)
-            printf "%b\n" "${GREEN}Launching ${install_path}${NC}" >"$outdev"
-            # Attach to terminal if possible; exec replaces the installer process
-            if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
-                exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty
+        # If we have a tty, attach the program to it by redirecting stdio to /dev/tty.
+        # Use exec so the installed program replaces the installer process (user's expectation).
+        if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
+            # try exec with proper fd redirection; if that fails fall back to direct exec
+            if exec "$install_path" </dev/tty >/dev/tty 2>/dev/tty; then
+                : # replaced by program
             else
-                # no tty: run in background as fallback
-                nohup "$install_path" >/dev/null 2>&1 &
+                # fallback attempt without explicit redirection
+                exec "$install_path" || {
+                    warn "Failed to exec ${install_path}"
+                }
             fi
-            ;;
-        background)
-            printf "%b\n" "${GREEN}Starting ${install_path} in background${NC}" >"$outdev"
+        else
+            # no terminal available: run in background
+            log "No tty available — launching installed program in background."
             nohup "$install_path" >/dev/null 2>&1 &
-            ;;
-    esac
+        fi
+    else
+        printf "%b\n" "${YELLOW}Installed file not executable or missing: ${install_path}${NC}" >"$outdev"
+    fi
 }
 
-# This presents a small numbered menu right before autostart.
-# It returns the selected mode string on stdout: launch|background|none|dry
-choose_autostart_for_run() {
-    local default_mode="${1:-$(read_autostart_mode)}"
-    # If no interactive terminal, return the default immediately
-    if [[ ! -r /dev/tty && ! -t 1 ]]; then
-        printf "%s" "$default_mode"
-        return 0
-    fi
-
-    # Show the menu on the controlling terminal so piped sudo runs see it
-    local out="/dev/tty"
-    printf "\n" >"$out"
-    printf "%b\n" "${ORANGE}Choose autostart mode for this run (the chosen mode will start 5 seconds after selection):${NC}" >"$out"
-    printf "Current default: %s\n" "$default_mode" >"$out"
-    printf " 1) launch     - start program in foreground after countdown\n" >"$out"
-    printf " 2) background - start program in background after countdown\n" >"$out"
-    printf " 3) none       - do NOT start program after install\n" >"$out"
-    printf " 4) dry        - simulate install; do not write file nor launch\n" >"$out"
-    printf "\n" >"$out"
-    printf "Press Enter to use default (%s).\n" "$default_mode" >"$out"
-
-    local choice=""
-    read -r -p "Choose [1-4]: " choice </dev/tty || choice=""
-
-    if [[ -z "$choice" ]]; then
-        printf "%s" "$default_mode"
-        return 0
-    fi
-
-    case "$choice" in
-        1) printf "launch" ;;
-        2) printf "background" ;;
-        3) printf "none" ;;
-        4) printf "dry" ;;
-        *) printf "%s" "$default_mode" ;;
-    esac
-}
-
-# install_action supports an optional mode parameter. 'dry' doesn't write the installed file.
 install_action(){
-    local cfg_mode="${1:-$(read_autostart_mode)}"
-
-    log "Installing LinkZero... (configured autostart mode: $cfg_mode)"
+    log "Installing LinkZero..."
     ensure_install_dir
     TMP_DL="$(mktemp /tmp/linkzero-XXXXXX.sh)"
     trap 'rm -f "${TMP_DL}"' EXIT
@@ -211,41 +125,27 @@ install_action(){
         err "Failed to download $SCRIPT_URL"; exit 1
     fi
     if grep -qiE '<!doctype html|<html' "$TMP_DL" 2>/dev/null; then
-        err "Downloaded file looks like HTML; check raw URL"; rm -f "$TMP_DL"; exit 1
+        err "Downloaded file looks like HTML; check raw URL"; exit 1
     fi
-
     install_path="$INSTALL_DIR/$SCRIPT_NAME"
-
-    # If interactive terminal is present, allow the user to choose the autostart mode
-    # that will be applied immediately (and started 5 seconds after selection).
-    local run_mode="$cfg_mode"
-    if [[ -r /dev/tty ]] || [[ -t 1 ]]; then
-        run_mode="$(choose_autostart_for_run "$cfg_mode")"
-    fi
-
-    if [[ "$run_mode" == "dry" ]]; then
-        printf "%b\n" "${ORANGE}Dry-run: would install $TMP_DL -> $install_path${NC}"
-        rm -f "$TMP_DL"
-        # Show the 5-second countdown and do NOT launch (dry)
-        countdown_and_launch "$install_path" "$run_mode" 5
-        return 0
-    fi
-
     mv "$TMP_DL" "$install_path"
     chmod +x "$install_path"
     log "Installed to $install_path"
 
-    # Immediately after install, show the orange countdown and start according to run_mode.
-    countdown_and_launch "$install_path" "$run_mode" 5
+    # After successful install: show countdown in orange and run the installed program (interactive only)
+    countdown_and_launch "$install_path" 5
 }
 
 # Uninstall: no prompt — remove known files/directories immediately.
 uninstall_action(){
     local install_path="$INSTALL_DIR/$SCRIPT_NAME"
-    local targets=("$install_path" "$CONFIG_DIR" "/usr/local/share/linkzero" "/var/lib/linkzero")
+    local targets=("$install_path" "/etc/linkzero" "/usr/local/share/linkzero" "/var/lib/linkzero")
     local any_found=false to_remove=()
     for t in "${targets[@]}"; do
-        if [[ -e "$t" ]]; then to_remove+=("$t"); any_found=true; fi
+        if [[ -e "$t" ]]; then
+            to_remove+=("$t")
+            any_found=true
+        fi
     done
 
     if [[ "$any_found" != true ]]; then
@@ -256,45 +156,24 @@ uninstall_action(){
     echo "Removing the following items (no confirmation):"
     for t in "${to_remove[@]}"; do echo "  $t"; done
 
+    # Perform removal (conservative reporting)
     for t in "${to_remove[@]}"; do
         if [[ -d "$t" ]]; then
-            if rm -rf -- "$t"; then log "Removed directory $t"; else warn "Failed to remove directory $t"; fi
+            if rm -rf -- "$t"; then
+                log "Removed directory $t"
+            else
+                warn "Failed to remove directory $t"
+            fi
         else
-            if rm -f -- "$t"; then log "Removed file $t"; else warn "Failed to remove file $t"; fi
+            if rm -f -- "$t"; then
+                log "Removed file $t"
+            else
+                warn "Failed to remove file $t"
+            fi
         fi
     done
 
     log "Uninstall completed."
-}
-
-# Configure autostart mode menu (same numbered-menu logic)
-configure_autostart_menu(){
-    echo ""
-    echo "Autostart mode configuration"
-    echo "Current mode: $(read_autostart_mode)"
-    echo "Choose autostart mode and press Enter:"
-    echo " 1) launch     - start program in foreground after countdown (default)"
-    echo " 2) background - start program in background after countdown"
-    echo " 3) none       - do NOT start program after install"
-    echo " 4) dry        - simulate install; do not write file nor launch"
-    echo ""
-
-    local choice
-    if [[ -r /dev/tty ]]; then
-        read -r -p "Choose [1-4]: " choice </dev/tty || choice=""
-    else
-        read -r -p "Choose [1-4]: " choice || choice=""
-    fi
-
-    if [[ -z "$choice" ]]; then choice=1; fi
-
-    case "$choice" in
-        1) write_autostart_mode "launch" && echo "Autostart mode set to: launch" ;;
-        2) write_autostart_mode "background" && echo "Autostart mode set to: background" ;;
-        3) write_autostart_mode "none" && echo "Autostart mode set to: none" ;;
-        4) write_autostart_mode "dry" && echo "Autostart mode set to: dry (simulated installs)" ;;
-        *) echo "Invalid choice" ;;
-    esac
 }
 
 # Parse args
@@ -302,7 +181,7 @@ for arg in "$@"; do
     case "$arg" in
         --install|-i) ACTION="install" ;;
         --uninstall|-u) ACTION="uninstall" ;;
-        --yes|-y) YES=true ;;
+        --yes|-y) YES=true ;;   # kept for backward compatibility but uninstall no longer prompts
         --force|-f) FORCE=true ;;
         --interactive) FORCE_MENU=true ;;
         -h|--help) printf "Usage: %s [--install|--uninstall] [--yes] [--interactive]\n" "$0"; exit 0 ;;
@@ -319,7 +198,7 @@ if [[ -n "$ACTION" ]]; then
     esac
 fi
 
-# Decide whether to show interactive menu
+# Decide whether we can show the interactive menu
 debug_dump
 CAN_MENU=false
 if [[ "$FORCE_MENU" == true ]]; then
@@ -336,11 +215,11 @@ if [[ "$CAN_MENU" != true ]]; then
     exit 0
 fi
 
-# ---------- Main numbered interactive menu ----------
-options=("Install LinkZero" "Uninstall LinkZero" "Configure Autostart Mode" "Exit")
+# ---------- Numbered interactive menu (robust) ----------
+options=("Install LinkZero" "Uninstall LinkZero" "Exit")
 declare -i sel_default=0
 if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" || -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
-    sel_default=2   # default to Uninstall when already installed (menu numbering 1..4)
+    sel_default=2   # default to Uninstall when already installed (menu numbering 1..3)
 else
     sel_default=1
 fi
@@ -349,33 +228,35 @@ echo "Use the numbers to choose and press Enter."
 echo ""
 for i in "${!options[@]}"; do
     num=$((i+1))
-    prefix=""
-    if [[ $num -eq $sel_default ]]; then prefix="*"; fi
+    prefix=" "
+    if [[ $num -eq $sel_default ]]; then
+        prefix="*"
+    fi
     printf "%s %d) %s\n" "$prefix" "$num" "${options[$i]}"
 done
 echo ""
 
+# Read choice from /dev/tty if available (works with sudo/piped runs). Fallback to stdin.
 CHOICE=""
 if [[ -r /dev/tty ]]; then
-    read -r -p "Choose [1-4]: " CHOICE </dev/tty || CHOICE=""
+    read -r -p "Choose [1-3]: " CHOICE </dev/tty || CHOICE=""
 else
-    read -r -p "Choose [1-4]: " CHOICE || CHOICE=""
+    read -r -p "Choose [1-3]: " CHOICE || CHOICE=""
 fi
 
-if [[ -z "$CHOICE" ]]; then CHOICE="$sel_default"; fi
+# If empty (user hit Enter), use default selection
+if [[ -z "$CHOICE" ]]; then
+    CHOICE="$sel_default"
+fi
 
 case "$CHOICE" in
     1)
-        MODE="$(read_autostart_mode)"
-        install_action "$MODE"
+        install_action
         ;;
     2)
         uninstall_action
         ;;
     3)
-        configure_autostart_menu
-        ;;
-    4)
         echo "Exit."
         ;;
     *)
