@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 #
 # LinkZero installer — simplified interactive menu (numbered choices)
-#
-# Uses a numbered prompt instead of arrow keys/raw mode for maximum reliability
-# across sudo, piped, and varied terminal environments.
+# Uninstall no longer prompts — it deletes known installed files immediately.
 #
 set -euo pipefail
 
@@ -79,12 +77,16 @@ install_action(){
     log "Installed to $install_path"
 }
 
+# Uninstall: no prompt — remove known files/directories immediately.
 uninstall_action(){
     local install_path="$INSTALL_DIR/$SCRIPT_NAME"
     local targets=("$install_path" "/etc/linkzero" "/usr/local/share/linkzero" "/var/lib/linkzero")
     local any_found=false to_remove=()
     for t in "${targets[@]}"; do
-        if [[ -e "$t" ]]; then to_remove+=("$t"); any_found=true; fi
+        if [[ -e "$t" ]]; then
+            to_remove+=("$t")
+            any_found=true
+        fi
     done
 
     if [[ "$any_found" != true ]]; then
@@ -92,29 +94,23 @@ uninstall_action(){
         return 0
     fi
 
-    echo "The following items will be removed:"
+    echo "Removing the following items (no confirmation):"
     for t in "${to_remove[@]}"; do echo "  $t"; done
 
-    if [[ "$YES" != true ]]; then
-        # Read confirmation from /dev/tty if available so piping won't break prompt
-        if [[ -r /dev/tty ]]; then
-            read -r -p "Confirm removal (y/N): " ans </dev/tty
-        else
-            # fallback to stdin
-            read -r -p "Confirm removal (y/N): " ans || ans="n"
-        fi
-
-        case "$ans" in
-            [yY]) ;;
-            *) warn "Uninstall cancelled."; return 0 ;;
-        esac
-    fi
-
+    # Perform removal (conservative reporting)
     for t in "${to_remove[@]}"; do
         if [[ -d "$t" ]]; then
-            rm -rf -- "$t" && log "Removed directory $t" || warn "Failed to remove $t"
+            if rm -rf -- "$t"; then
+                log "Removed directory $t"
+            else
+                warn "Failed to remove directory $t"
+            fi
         else
-            rm -f -- "$t" && log "Removed file $t" || warn "Failed to remove $t"
+            if rm -f -- "$t"; then
+                log "Removed file $t"
+            else
+                warn "Failed to remove file $t"
+            fi
         fi
     done
 
@@ -126,7 +122,7 @@ for arg in "$@"; do
     case "$arg" in
         --install|-i) ACTION="install" ;;
         --uninstall|-u) ACTION="uninstall" ;;
-        --yes|-y) YES=true ;;
+        --yes|-y) YES=true ;;   # kept for backward compatibility but uninstall no longer prompts
         --force|-f) FORCE=true ;;
         --interactive) FORCE_MENU=true ;;
         -h|--help) printf "Usage: %s [--install|--uninstall] [--yes] [--interactive]\n" "$0"; exit 0 ;;
