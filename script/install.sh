@@ -223,16 +223,13 @@ animate_author() {
     local idx=0
     # Protect against missing OUTPUT_PATH
     local out="${OUTPUT_PATH:-/dev/stdout}"
-    # hide cursor while animating so it doesn't blink and interfere
-    printf '\033[?25l' >"$out" 2>/dev/null || true
     while true; do
         local color="${colors[$((idx % ${#colors[@]}))]}"
         # Save cursor, move to absolute pos, print colored author, restore cursor
         printf '\033[s' >"$out" 2>/dev/null || true
         printf '\033[%s;%sH' "$row" "$col" >"$out" 2>/dev/null || true
-        # Use %b to interpret escape sequences for color and bold (don't pass escapes through %s)
-        printf "%b%s%b" "$color$BOLD" "$AUTHOR_TEXT" "$NC" >"$out" 2>/dev/null || true
-        # pad to clear any leftover chars if previous text was longer
+        # Print and pad to clear previous content
+        printf "%b%s%b" "$color" "$BOLD$AUTHOR_TEXT$NC" >"$out" 2>/dev/null || true
         printf "%b" "   " >"$out" 2>/dev/null || true
         printf '\033[u' >"$out" 2>/dev/null || true
         sleep 0.15
@@ -258,23 +255,20 @@ start_rainbow_author() {
     # Start animator in background, detached from job control
     animate_author "$AUTHOR_ROW" "$AUTHOR_COL" >/dev/null 2>&1 &
     ANIM_PID=$!
-    # Ensure we try to kill background children and restore cursor on exit
+    # Ensure we try to kill background children on exit
+    kill_animator_on_exit() {
+        kill_animator
+    }
     trap 'kill_animator' EXIT
     return 0
 }
 
 kill_animator() {
-    # Make sure OUTPUT_PATH is available so we can restore cursor visibility
-    try_open_tty || true
-    open_io || true
     if [[ -n "${ANIM_PID:-}" ]]; then
         kill "${ANIM_PID}" 2>/dev/null || true
         wait "${ANIM_PID}" 2>/dev/null || true
         ANIM_PID=""
     fi
-    # show cursor again
-    local out="${OUTPUT_PATH:-/dev/stdout}"
-    printf '\033[?25h' >"$out" 2>/dev/null || true
 }
 
 # --------------- End rainbow helpers ----------------
