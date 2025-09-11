@@ -1,10 +1,8 @@
 #!/bin/bash
 #
-# LinkZero installer — interactive menu with verbose tty/debug reporting
+# LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# This version prints explicit debug information about tty detection and will
-# not silently exit. If the installer detects a non-interactive environment,
-# it prints a clear message and waits for Enter so you can see the reason.
+# Update: removed all countdowns — actions (launch / dry / none) occur immediately.
 #
 set -euo pipefail
 
@@ -17,7 +15,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 ORANGE='\033[0;33m'
 
-# Print header
+# Clear the screen and print the header when stdout is a terminal.
 if [[ -t 1 ]]; then
     clear
 fi
@@ -55,9 +53,10 @@ err()    { echo -e "${RED}[ERR]${NC} $*"; }
 # Try to open a terminal on fd 3. Order:
 # 1) /dev/tty
 # 2) SUDO_TTY (if set)
-# If neither works, USE_TTY_FD=false
+# 3) don't open anything (we will only use stdin if it's a real tty)
 USE_TTY_FD=false
 try_open_tty() {
+    # close previous fd3 if any
     exec 3<&- 2>/dev/null || true
 
     if [[ -r /dev/tty ]]; then
@@ -82,7 +81,7 @@ try_open_tty() {
     return 1
 }
 
-# Determine input/output paths to use for prompts.
+# Determine input/output paths to use for line-based prompts.
 INPUT_FD=""
 OUTPUT_PATH=""
 open_io() {
@@ -90,7 +89,9 @@ open_io() {
     OUTPUT_PATH="/dev/stdout"
 
     if [[ "$USE_TTY_FD" == true ]]; then
+        # fd3 is open for read
         INPUT_FD="/dev/fd/3"
+        # prefer /dev/tty for output so prompts are visible even if stdout is redirected
         if [[ -w /dev/tty ]]; then
             OUTPUT_PATH="/dev/tty"
         else
@@ -100,6 +101,7 @@ open_io() {
         INPUT_FD="/dev/tty"
         OUTPUT_PATH="/dev/tty"
     elif [[ -t 0 ]]; then
+        # fallback to stdin/stdout if it's a real tty
         INPUT_FD="/dev/stdin"
         OUTPUT_PATH="/dev/stdout"
     else
@@ -109,6 +111,7 @@ open_io() {
 }
 
 # Read a line from chosen input fd into variable named by first arg.
+# Usage: read_line varname "prompt text"
 read_line() {
     local __var="$1"; shift
     local prompt="$*"
@@ -136,9 +139,17 @@ for arg in "$@"; do
     esac
 done
 
-# Helper funcs
-is_installed() {
-    [[ -x "${INSTALL_DIR}/${SCRIPT_NAME}" ]]
+# DEBUG info helper
+debug_dump() {
+    if [[ -n "$DEBUG" ]]; then
+        printf "DEBUG: -t0=%s -t1=%s SUDO_TTY=%s USE_TTY_FD=%s NONINTERACTIVE=%s CI=%s\n" \
+            "$( [[ -t 0 ]] && echo true || echo false )" \
+            "$( [[ -t 1 ]] && echo true || echo false )" \
+            "${SUDO_TTY:-}" \
+            "$USE_TTY_FD" \
+            "${NONINTERACTIVE:-}" \
+            "${CI:-}"
+    fi
 }
 
 ensure_install_dir() {
@@ -156,11 +167,12 @@ download_script_to_temp() {
     fi
 }
 
-# prelaunch menu (3 options)
+# Pre-autostart numeric menu (3 options: launch, dry, none)
 choose_prelaunch_mode() {
     open_io
 
     if [[ -z "$INPUT_FD" ]]; then
+        # no interactive input — default to launch
         printf "launch"
         return 0
     fi
@@ -180,7 +192,11 @@ choose_prelaunch_mode() {
     esac
 }
 
-# apply mode (no countdown)
+# Apply selected mode immediately (no countdown)
+# modes:
+#  - dry  -> run installed binary with --dry-run (attached to /dev/tty if possible)
+#  - none -> do nothing, return to caller immediately
+#  - launch-> start installed binary (attached if possible) and then exit installer
 countdown_and_apply_mode() {
     local install_path="$1"
     local mode="$2"
@@ -199,10 +215,11 @@ countdown_and_apply_mode() {
             fi
             printf "%b\n" "${GREEN}Running dry-run: ${install_path} --dry-run${NC}" >"$out"
             if [[ -w /dev/tty ]]; then
+                # run attached to tty and wait (subshell so installer is not replaced)
                 ( "$install_path" --dry-run </dev/tty >/dev/tty 2>/dev/tty )
             else
+                # no tty; run detached so installer can continue/exit cleanly
                 nohup "$install_path" --dry-run >/dev/null 2>&1 &
-                printf "%b\n" "${GREEN}Dry-run started in background (nohup).${NC}" >"$out"
             fi
             return 0
             ;;
@@ -214,10 +231,8 @@ countdown_and_apply_mode() {
             printf "%b\n" "${GREEN}Launching ${install_path} (attached if possible)${NC}" >"$out"
             if [[ -w /dev/tty ]]; then
                 ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty ) &
-                printf "%b\n" "${GREEN}Launched (attached subshell).${NC}" >"$out"
             else
                 nohup "$install_path" >/dev/null 2>&1 &
-                printf "%b\n" "${GREEN}Launched in background (nohup).${NC}" >"$out"
             fi
             return 0
             ;;
@@ -244,39 +259,22 @@ install_action() {
     chmod +x "$install_path"
     log "Installed to $install_path"
 
+    # pre-autostart numeric menu
     try_open_tty || true
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
 
+    # Apply selected mode immediately (no countdown)
     countdown_and_apply_mode "$install_path" "$chosen_mode"
 
     if [[ "$chosen_mode" == "none" ]]; then
+        # return to main menu (caller is the menu loop)
         return 0
     fi
 
+    # For other modes (launch/dry) preserve previous behavior and exit installer after completing.
     exec 3<&- 2>/dev/null || true
     exit 0
-}
-
-run_installed_action() {
-    local install_path="$INSTALL_DIR/$SCRIPT_NAME"
-    open_io
-    local out="$OUTPUT_PATH"
-
-    if [[ ! -x "$install_path" ]]; then
-        printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
-        return 0
-    fi
-
-    printf "%b\n" "${GREEN}Running installed program: ${install_path}${NC}" >"$out"
-    if [[ -w /dev/tty ]]; then
-        ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty )
-        printf "%b\n" "${GREEN}Program exited; returning to installer menu.${NC}" >"$out"
-    else
-        nohup "$install_path" >/dev/null 2>&1 &
-        printf "%b\n" "${GREEN}Program started in background (nohup).${NC}" >"$out"
-    fi
-    return 0
 }
 
 uninstall_action() {
@@ -286,13 +284,15 @@ uninstall_action() {
         return 0
     fi
 
+    # Uninstall: no confirmation, just remove
     rm -f "$install_path" && log "Removed $install_path"
     return 0
 }
 
-# If explicit action requested, do it and exit immediately
+# If explicit action requested, do it and exit
 if [[ -n "$ACTION" ]]; then
     try_open_tty || true
+    debug_dump
     case "$ACTION" in
         install) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
         uninstall) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
@@ -301,75 +301,31 @@ fi
 
 # Decide whether we can show the interactive menu
 try_open_tty || true
-open_io
+debug_dump
 
-# Print explicit debug status so you can see what happened
-{
-    printf "%b\n" "${BLUE}-- Debug: TTY/Environment status --${NC}"
-    printf "stdin isatty: %s\n" "$( [[ -t 0 ]] && echo true || echo false )"
-    printf "stdout isatty: %s\n" "$( [[ -t 1 ]] && echo true || echo false )"
-    printf "USE_TTY_FD: %s\n" "$USE_TTY_FD"
-    printf "SUDO_TTY: %s\n" "${SUDO_TTY:-<unset>}"
-    printf "TERM: %s\n" "${TERM:-<unset>}"
-    printf "CI: %s\n" "${CI:-<unset>}"
-    printf "NONINTERACTIVE: %s\n" "${NONINTERACTIVE:-<unset>}"
-    printf "%b\n" "${BLUE}-- End debug --${NC}"
-} >"$OUTPUT_PATH"
-
-# determine if we can show the interactive menu
 CAN_MENU=false
 if [[ "$FORCE_MENU" == true ]]; then
     CAN_MENU=true
-elif [[ "$USE_TTY_FD" == true ]] || [[ -t 0 ]] || [[ -t 1 ]]; then
+elif [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] && [[ -t 1 ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]] ); then
     CAN_MENU=true
 fi
 
-# If we can't show the menu, do NOT auto-install and do not exit silently.
 if [[ "$CAN_MENU" != true ]]; then
-    printf "%b\n" "${RED}[ERROR] Interactive menu not available. Script will not continue automatically.${NC}" >"$OUTPUT_PATH"
-    printf "%b\n" "Run this script from a terminal, or use --install to install non-interactively." >"$OUTPUT_PATH"
-    # wait so user can see message (prevents immediate silent exit)
-    if [[ -w /dev/tty ]]; then
-        printf "\nPress Enter to exit..." > /dev/tty
-        read -r _ </dev/tty || true
-    else
-        read -r _ || true
-    fi
+    warn "Interactive menu not available — running non-interactive install."
+    install_action
     exec 3<&- 2>/dev/null || true
-    exit 1
+    exit 0
 fi
 
-# Numeric-style interactive main menu loop (dynamic options when installed)
+# Numeric-style interactive main menu loop
+options=("Install LinkZero" "Uninstall LinkZero" "Exit")
+
 while true; do
-    # build menu dynamically
-    MENU_TEXT=()
-    MENU_ACTION=()
-
-    MENU_TEXT+=("Install LinkZero")
-    MENU_ACTION+=("install")
-
-    if is_installed; then
-        MENU_TEXT+=("Run LinkZero")
-        MENU_ACTION+=("run")
-    fi
-
-    MENU_TEXT+=("Uninstall LinkZero")
-    MENU_ACTION+=("uninstall")
-
-    MENU_TEXT+=("Exit")
-    MENU_ACTION+=("exit")
-
-    # choose default: prefer "run" if installed, otherwise "install"
-    default_choice_index=1
-    if is_installed; then
-        for idx in "${!MENU_ACTION[@]}"; do
-            if [[ "${MENU_ACTION[$idx]}" == "run" ]]; then
-                default_choice_index=$((idx+1))
-                break
-            fi
-        done
+    # Determine default based on presence of installed file
+    if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
+        default_choice=2
     else
-        default_choice_index=1
+        default_choice=1
     fi
 
     try_open_tty || true
@@ -377,51 +333,36 @@ while true; do
 
     printf "\n" >"$OUTPUT_PATH"
     printf "Use numeric menu to choose an action:\n" >"$OUTPUT_PATH"
-    for i in "${!MENU_TEXT[@]}"; do
-        printf "  %d) %s\n" $((i+1)) "${MENU_TEXT[$i]}" >"$OUTPUT_PATH"
+    for i in "${!options[@]}"; do
+        printf "  %d) %s\n" $((i+1)) "${options[$i]}" >"$OUTPUT_PATH"
     done
 
     # Prompt for selection
-    read_line selection "Choose [1-${#MENU_TEXT[@]}] (default=${default_choice_index}): "
+    read_line selection "Choose [1-3] (default=${default_choice}): "
     selection="${selection%%[[:space:]]*}"
 
     if [[ -z "$selection" ]]; then
-        selection="${default_choice_index}"
+        selection="$default_choice"
     fi
 
-    # validate numeric
-    if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
-        printf "%b\n" "${YELLOW}Invalid selection; try again.${NC}" >"$OUTPUT_PATH"
-        continue
-    fi
-
-    if (( selection < 1 || selection > ${#MENU_ACTION[@]} )); then
-        printf "%b\n" "${YELLOW}Invalid selection; try again.${NC}" >"$OUTPUT_PATH"
-        continue
-    fi
-
-    chosen_action="${MENU_ACTION[$((selection-1))]}"
-
-    case "$chosen_action" in
-        install)
+    case "$selection" in
+        1)
             install_action
+            # If install_action returns (chosen_mode == none), loop will continue; otherwise install_action exits.
             continue
             ;;
-        run)
-            run_installed_action
-            continue
-            ;;
-        uninstall)
+        2)
             uninstall_action
+            # After uninstall, show status then loop back so user can choose again
             continue
             ;;
-        exit)
-            printf "Exit.\n" >"$OUTPUT_PATH"
+        3|q|Q)
+            echo "Exit." >"$OUTPUT_PATH"
             exec 3<&- 2>/dev/null || true
             exit 0
             ;;
         *)
-            printf "%b\n" "${YELLOW}Unhandled action; try again.${NC}" >"$OUTPUT_PATH"
+            warn "Invalid selection; try again."
             continue
             ;;
     esac
