@@ -4,23 +4,19 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Behavior in this version:
-# - If cPanel is detected on the host, the script unconditionally assumes the
-#   mail server is "exim (cPanel)" and displays that in the INFO lines.
-# - Backups are non-interactive and always use the ".link0" suffix. Backup
-#   actions do NOT print an "Action:" prompt; they run immediately (or are
-#   recorded in dry-run).
-# - Other potentially disruptive actions (edits, service restarts, firewall)
-#   remain interactive.
-# - Full commands are written only to LOG_FILE for auditing; the terminal never
-#   displays the raw command text.
+# Changes in this revision:
+# - Display the mail server name with a capitalized first letter (e.g. "Exim").
+# - When cPanel is detected the script unconditionally treats the mailserver as
+#   Exim (cPanel) and shows "(cPanel)" in the INFO line.
+# - The INFO line now also includes the Exim version (if `exim -bV` is available).
+# - Backups remain non-interactive and use the .link0 suffix.
 #
 set -euo pipefail
 
 LOG_FILE="/var/log/linkzero-smtp-security.log"
 DRY_RUN="${DRY_RUN:-false}"
 
-# Terminal colors (only when interactive)
+# Use colors only when stdout is a terminal
 if [[ -t 1 ]]; then
   RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
   BLUE=$'\033[0;34m'; MAGENTA=$'\033[0;35m'; CYAN=$'\033[0;36m'
@@ -29,14 +25,16 @@ else
   RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; RESET=''
 fi
 
+# Arrays for summary
 declare -a ACTION_DESCS
 declare -a ACTION_CMDS
 declare -a ACTION_RESULTS   # executed / skipped / dry-accepted / failed / already
 
-# Mail server variant (populated by detect_active_mailserver)
+# Mail server variant and detected version
 MAIL_SERVER_VARIANT=""
+EXIM_VERSION="unknown"
 
-# Filter function: hide timestamp-prefixed lines on terminal
+# Helper: hide timestamp-prefixed lines on terminal
 filter_out_timestamp_lines() {
   local re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
   while IFS= read -r line; do
@@ -58,6 +56,7 @@ log() {
   local level="$1"; shift
   local msg="$*"
   log_to_file "$level" "$msg"
+
   if [[ "${DRY_RUN}" == "true" ]]; then
     if [[ -t 1 ]]; then
       printf '[%s] %s\n' "$level" "$msg"
@@ -78,7 +77,7 @@ log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
-# Log a line containing command text to logfile only
+# Write full command text to logfile only
 log_command_to_file_only() {
   local level="$1"; shift
   local msg="$1"; shift
@@ -86,7 +85,7 @@ log_command_to_file_only() {
   log_to_file "$level" "$msg: $cmd"
 }
 
-# Non-interactive backup action (no "Action:" prompt). Respects DRY_RUN.
+# Non-interactive backup action
 perform_backup() {
   local desc="$1"; shift
   local cmd="$*"
@@ -99,7 +98,7 @@ perform_backup() {
   if [[ "${DRY_RUN}" == "true" ]]; then
     printf "%b%s%b\n" "${GREEN}" "Backup recorded (dry-run)" "${RESET}"
     ACTION_RESULTS+=("dry-accepted")
-    log_command_to_file_only "INFO" "DRY-RUN: backup not executed" "$cmd"
+    log_command_to_file_only "INFO" "DRY-RUN: would run backup" "$cmd"
     return 0
   fi
 
@@ -117,7 +116,7 @@ perform_backup() {
   fi
 }
 
-# Interactive yes/no chooser (arrow keys)
+# Interactive yes/no chooser (arrow keys/Enter)
 choose_yes_no() {
   local prompt="$1"
   if ! [[ -t 0 ]]; then
@@ -131,26 +130,12 @@ choose_yes_no() {
 
   while true; do
     printf '\r\033[K'
-    if [[ $sel -eq 0 ]]; then
-      option_yes="${GREEN}YES${RESET}"; option_no="NO"
-    else
-      option_yes="YES"; option_no="${RED}NO${RESET}"
-    fi
-
+    if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
-
     IFS= read -rsn1 key 2>/dev/null || key=''
-
-    if [[ $key == $'\x1b' ]]; then
-      IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
-      key+="$rest"
-    fi
-
+    if [[ $key == $'\x1b' ]]; then IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''; key+="$rest"; fi
     case "$key" in
-      $'\n'|$'\r'|'')
-        printf "\n"; tput cnorm 2>/dev/null || true
-        [[ $sel -eq 0 ]] && return 0 || return 1
-        ;;
+      $'\n'|$'\r'|'') printf "\n"; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && return 0 || return 1 ;;
       $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
       h|H|l|L) sel=$((1 - sel)) ;;
       q|Q) printf "\n"; echo -e "${RED}Aborted by user.${RESET}"; tput cnorm 2>/dev/null || true; exit 1 ;;
@@ -159,7 +144,7 @@ choose_yes_no() {
   done
 }
 
-# perform_action (interactive) — prints Action: desc and prompts user
+# perform_action: interactive operations (edits/restarts/etc.)
 perform_action(){
   local desc="$1"; shift
   local cmd="$*"
@@ -173,7 +158,7 @@ perform_action(){
 
   if choose_yes_no "Apply?"; then
     if [[ "${DRY_RUN}" == "true" ]]; then
-      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
+      printf "%b%s%b\n" "${GREEN}" "Changes has been applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
       log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"
       return 0
@@ -199,18 +184,21 @@ perform_action(){
   fi
 }
 
-# Firewall detection (unchanged)
+# Firewall helpers (kept minimal/robust)
 csf_present() {
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet csf 2>/dev/null || systemctl is-active --quiet lfd 2>/dev/null; then return 0; fi
   fi
   if pgrep -x csf >/dev/null 2>&1 || pgrep -x lfd >/dev/null 2>&1 || pgrep -f '/usr/local/csf' >/dev/null 2>&1; then return 0; fi
-  if [[ -d /etc/csf ]] || [[ -d /usr/local/csf ]] || [[ -x /usr/sbin/csf ]]; then return 0; fi
+  [[ -d /etc/csf || -d /usr/local/csf || -x /usr/sbin/csf || -x /usr/local/sbin/csf ]] && return 0
   return 1
 }
+
 detect_active_firewall() {
   if csf_present; then echo "csf"; return 0; fi
-  if command -v nft >/dev/null 2>&1; then if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi; fi
+  if command -v nft >/dev/null 2>&1; then
+    if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi
+  fi
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then echo "firewalld"; return 0; fi
     if systemctl is-active --quiet firewalld 2>/dev/null; then echo "firewalld"; return 0; fi
@@ -222,7 +210,6 @@ detect_active_firewall() {
 firewall_change_exists() {
   local manager="$1"; shift
   local cmd="$*"
-  # minimal port-extraction check (same approach as before)
   local ports_found
   ports_found="$(echo "$cmd" | grep -oE '([0-9]{2,5})' | tr '\n' ' ' | tr ' ' '\n' | sort -u || true)"
   if [[ -z "$ports_found" ]]; then return 1; fi
@@ -234,8 +221,7 @@ firewall_change_exists() {
       csf)
         if [[ -r /etc/csf/csf.conf ]]; then
           local line; line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 || true)"
-          line="${line#*=}"
-          line="${line//\"/}"; line="${line//\'/}"; line="${line// /}"
+          line="${line#*=}"; line="${line//\"/}"; line="${line//\'/}"; line="${line// /}"
           for p in 25 465 587; do grep -q "^$p\$" <<<"${line//,/\\n}" && return 0 || true; done
         fi
         ;;
@@ -293,26 +279,37 @@ configure_firewall() {
   esac
 }
 
-# MAIL SERVER DETECTION
-# Priority: cPanel -> exim -> postfix -> none
-# If cPanel markers exist, force exim + set MAIL_SERVER_VARIANT="cPanel".
+# Mail-server detection:
+# Priority: cPanel -> exim binary -> postfix -> none
+# If cPanel detected, assume Exim (cPanel).
 detect_active_mailserver() {
   MAIL_SERVER_VARIANT=""
 
-  # Strong cPanel detection (if present, assume Exim (cPanel) even if exim binary not visible)
+  # If cPanel exists (broad checks), assume Exim (cPanel)
   if [[ -d /usr/local/cpanel ]] || [[ -d /var/cpanel ]] || [[ -f /usr/local/cpanel/version ]] || \
      [[ -f /var/cpanel/exim.conf ]] || [[ -f /var/cpanel/main_exim.conf ]] || \
      [[ -x /usr/local/cpanel/bin/rebuildeximconf ]] || [[ -x /scripts/rebuildeximconf ]]; then
     MAIL_SERVER_VARIANT="cPanel"
+    # attempt to capture exim version if exim binary present
+    if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
+      local exim_v; exim_v="$(exim -bV 2>&1 || true)"
+      EXIM_VERSION="$(printf '%s\n' "$exim_v" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
+      EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$exim_v" | sed -n '1p' | xargs || true)}"
+      EXIM_VERSION="${EXIM_VERSION:-unknown}"
+    else
+      EXIM_VERSION="unknown"
+    fi
     echo "exim"
     return 0
   fi
 
-  # If not cPanel, fall back to binary checks
+  # If not cPanel, check exim binary presence
   if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-    # If exim -bV contains cPanel references, still mark cPanel variant
-    local exim_v
-    exim_v="$(exim -bV 2>&1 || true)"
+    local exim_v; exim_v="$(exim -bV 2>&1 || true)"
+    EXIM_VERSION="$(printf '%s\n' "$exim_v" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
+    EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$exim_v" | sed -n '1p' | xargs || true)}"
+    EXIM_VERSION="${EXIM_VERSION:-unknown}"
+    # If exim -bV contains cPanel references, mark variant too
     if printf '%s\n' "$exim_v" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then
       MAIL_SERVER_VARIANT="cPanel"
     fi
@@ -320,6 +317,7 @@ detect_active_mailserver() {
     return 0
   fi
 
+  # Postfix fallback
   if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
     echo "postfix"
     return 0
@@ -329,7 +327,16 @@ detect_active_mailserver() {
   return 0
 }
 
-# Configure Postfix
+# Helper: Capitalize first letter for display ("exim" -> "Exim")
+capitalize_first() {
+  local s="$1"
+  if [[ -z "$s" ]]; then echo ""; return; fi
+  local first="${s:0:1}"
+  local rest="${s:1}"
+  printf '%s%s' "${first^^}" "$rest"
+}
+
+# Configure Postfix (unchanged)
 configure_postfix(){
   log_info "Configuring Postfix to require TLS for AUTH"
   if ! command -v postconf >/dev/null 2>&1; then log_info "postconf not present; skipping Postfix configuration"; return 0; fi
@@ -341,11 +348,10 @@ configure_postfix(){
   if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart"; fi
 }
 
-# Configure Exim
+# Configure Exim (edits remain interactive; backups non-interactive)
 configure_exim(){
   log_info "Configuring Exim to require TLS for AUTH (if Exim is present or cPanel assumed)"
 
-  # If exim binary not present but cPanel variant is set, proceed using cPanel assumptions
   if ! command -v exim >/dev/null 2>&1 && ! command -v exim4 >/dev/null 2>&1 && [[ -z "${MAIL_SERVER_VARIANT}" ]]; then
     log_info "Exim not present; skipping Exim configuration"
     return 0
@@ -359,7 +365,7 @@ configure_exim(){
   elif [[ -f /etc/exim.conf ]]; then exim_conf="/etc/exim.conf"
   fi
 
-  # If cPanel is present (we assume exim (cPanel)), check typical cPanel config locations first
+  # If cPanel assumed, search cPanel locations
   if [[ -z "$exim_conf" && "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
     local candidates=(
       "/var/cpanel/exim.conf"
@@ -374,7 +380,6 @@ configure_exim(){
         if [[ -f "$f" ]]; then exim_conf="$f"; break 2; fi
       done
     done
-
     if [[ -z "$exim_conf" ]]; then
       local found
       found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
@@ -384,18 +389,18 @@ configure_exim(){
     if [[ -n "$exim_conf" ]]; then
       log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"
     else
-      log_info "cPanel detected but Exim config file not found in common cPanel locations; will proceed with best-effort checks"
+      log_info "cPanel detected but Exim config file not found in common cPanel locations; proceeding best-effort"
     fi
   fi
 
-  # If still not found, try parsing exim -bV or detect exim4 split-config
+  # If still not found, parse exim -bV or detect split-config
   if [[ -z "$exim_conf" ]]; then
     if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-      local exim_v
-      exim_v="$(exim -bV 2>&1 || true)"
+      local exim_v; exim_v="$(exim -bV 2>&1 || true)"
       exim_conf="$(printf '%s\n' "$exim_v" | sed -nE 's/.*Configuration file[^:]*:[[:space:]]*(.+)$/\1/p' | head -n1 || true)"
       if [[ -z "$exim_conf" ]] && printf '%s\n' "$exim_v" | grep -qi '/etc/exim4'; then
-        if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"; elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
+        if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"
+        elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
       fi
       exim_conf="$(echo "$exim_conf" | xargs || true)"
       if [[ -n "$exim_conf" && -f "$exim_conf" ]]; then
@@ -411,7 +416,6 @@ configure_exim(){
     fi
   fi
 
-  # If we have a config path (file or split-config dir), back it up non-interactively and then prompt for edits
   if [[ -n "$exim_conf" ]]; then
     local timestamp; timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
@@ -439,7 +443,6 @@ configure_exim(){
 test_configuration(){
   log_info "Running basic mail-server checks (prompted)"
   if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then perform_action "Postfix: basic configuration check" "postfix check"; fi
-  # If cPanel variant or exim binary present, show exim -bV (interactive)
   if [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]] || command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
     perform_action "Exim: basic configuration info" "exim -bV"
   fi
@@ -449,15 +452,14 @@ _print_summary(){
   echo -e "${BLUE}${BOLD}Summary:${RESET}"
   local i
   for i in "${!ACTION_DESCS[@]}"; do
-    local d="${ACTION_DESCS[$i]}"
-    local r="${ACTION_RESULTS[$i]}"
+    local d="${ACTION_DESCS[$i]}"; local r="${ACTION_RESULTS[$i]}"
     case "$r" in
-      executed)     printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "$GREEN" "$RESET" "$d" ;;
-      failed)       printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
-      skipped)      printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
+      executed) printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "$GREEN" "$RESET" "$d" ;;
+      failed) printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
+      skipped) printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
       dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
-      already)      printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "$BLUE" "$RESET" "$d" ;;
-      *)             printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
+      already) printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "$BLUE" "$RESET" "$d" ;;
+      *) printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
     esac
   done
 }
@@ -485,17 +487,21 @@ main(){
 
   configure_firewall
 
-  # Mail server selection & execution policy: cPanel -> exim -> postfix -> none
   local mail_svc
   mail_svc="$(detect_active_mailserver)"
 
-  # Build display label including variant if detected
-  local display_label="$mail_svc"
+  # Build display_label with capitalized service and optional variant + version
+  local svc_disp; svc_disp="$(capitalize_first "$mail_svc")"
+  local variant_display=""
   if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
-    display_label="${mail_svc} (${MAIL_SERVER_VARIANT})"
+    variant_display=" (${MAIL_SERVER_VARIANT})"
+  fi
+  local version_display=""
+  if [[ "${mail_svc}" == "exim" ]]; then
+    version_display=" — version: ${EXIM_VERSION:-unknown}"
   fi
 
-  log_info "Detected mail server: ${display_label}"
+  log_info "Detected mail server: ${svc_disp}${variant_display}${version_display}"
 
   case "$mail_svc" in
     exim)
