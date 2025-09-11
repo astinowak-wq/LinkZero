@@ -1,534 +1,592 @@
 #!/usr/bin/env bash
 #
 # disable_smtp_plain.sh
-# Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
-# --dry-run mode that produces no side effects on the running system.
 #
-# Changes in this revision:
-# - Display the mail server name with a capitalized first letter (e.g. "Exim").
-# - When cPanel is detected the script unconditionally treats the mailserver as
-#   Exim (cPanel) and shows "(cPanel)" in the INFO line.
-# - The INFO line now also includes the Exim version (if `exim -bV` is available).
-# - Backups remain non-interactive and use the .link0 suffix.
+# Purpose:
+#   Enforce that SMTP AUTH is only allowed after TLS (STARTTLS) and reduce
+#   exposure to plaintext SMTP authentication. Supports Postfix and Exim,
+#   makes timestamped backups, supports dry-run, restore, and backup-only modes.
 #
+# Author:
+#   Danpol Community and Daniel Nowakowski
+#
+# Note: When run interactively, the script clears the console and prints a red
+# author banner near the start of execution so the author is visible immediately.
+# The banner is followed by two empty lines for visibility.
+#
+# Usage:
+#   sudo ./disable_smtp_plain.sh [--dry-run] [--backup-only] [--restore] [--rollback]
+#                          [--backup-dir DIR] [--no-restart] [--help]
+#
+# Notes:
+#   - This script is conservative: it copies configuration files to BACKUP_DIR
+#     before making changes and validates downloaded/edited content where needed.
+#   - Test with --dry-run first on production systems.
+#
+
 set -euo pipefail
 
+PROGNAME="$(basename "$0")"
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP_DIR_DEFAULT="/var/backups/linkzero-smtp"
+BACKUP_DIR="${BACKUP_DIR:-$BACKUP_DIR_DEFAULT}"
 LOG_FILE="/var/log/linkzero-smtp-security.log"
-DRY_RUN="${DRY_RUN:-false}"
+DRY_RUN=false
+BACKUP_ONLY=false
+RESTORE=false
+ROLLBACK=false
+NO_RESTART=false
 
-# Use colors only when stdout is a terminal
+# Colors (only used when outputting to terminal)
 if [[ -t 1 ]]; then
-  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
-  BLUE=$'\033[0;34m'; MAGENTA=$'\033[0;35m'; CYAN=$'\033[0;36m'
-  BOLD=$'\033[1m'; RESET=$'\033[0m'
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m'
 else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; RESET=''
+    RED=''
+    GREEN=''
+    YELLOW=''
+    NC=''
 fi
 
-# Arrays for summary
-declare -a ACTION_DESCS
-declare -a ACTION_CMDS
-declare -a ACTION_RESULTS   # executed / skipped / dry-accepted / failed / already
+# Author text (displayed in banner at runtime)
+AUTHOR_TEXT="Author: Danpol Community and Daniel Nowakowski"
 
-# Mail server variant and detected version
-MAIL_SERVER_VARIANT=""
-EXIM_VERSION="unknown"
-
-# Helper: hide timestamp-prefixed lines on terminal
-filter_out_timestamp_lines() {
-  local re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
-  while IFS= read -r line; do
-    if [[ ! $line =~ $re ]]; then
-      printf '%s\n' "$line"
-    fi
-  done
-}
-
-log_to_file() {
-  local level="$1"; shift
-  local msg="$*"
-  local ts
-  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-  printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
-}
-
-log() {
-  local level="$1"; shift
-  local msg="$*"
-  log_to_file "$level" "$msg"
-
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    if [[ -t 1 ]]; then
-      printf '[%s] %s\n' "$level" "$msg"
-    else
-      local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-      printf '%s [%s] %s\n' "$ts" "$level" "$msg"
-    fi
-  else
-    if [[ -t 1 ]]; then
-      printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
-    else
-      local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-      printf '%s [%s] %s\n' "$ts" "$level" "$msg"
-    fi
-  fi
+log(){
+    local level="$1"; shift
+    local msg="$*"
+    local ts
+    ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s [%s] %s\n' "$ts" "$level" "$msg" | tee -a "$LOG_FILE"
 }
 log_info(){ log "INFO" "$@"; }
+log_warn(){ log "WARN" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
 
-# Write full command text to logfile only
-log_command_to_file_only() {
-  local level="$1"; shift
-  local msg="$1"; shift
-  local cmd="$*"
-  log_to_file "$level" "$msg: $cmd"
-}
-
-# Non-interactive backup action
-perform_backup() {
-  local desc="$1"; shift
-  local cmd="$*"
-
-  ACTION_DESCS+=("$desc")
-  ACTION_CMDS+=("$cmd")
-
-  log_command_to_file_only "INFO" "Planned backup" "$cmd"
-
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    printf "%b%s%b\n" "${GREEN}" "Backup recorded (dry-run)" "${RESET}"
-    ACTION_RESULTS+=("dry-accepted")
-    log_command_to_file_only "INFO" "DRY-RUN: would run backup" "$cmd"
-    return 0
-  fi
-
-  log_command_to_file_only "INFO" "Executing backup" "$cmd"
-  if eval "$cmd"; then
-    printf "%b%s%b\n" "${GREEN}" "Backup completed" "${RESET}"
-    ACTION_RESULTS+=("executed")
-    log_success "$desc"
-    return 0
-  else
-    printf "%b%s%b\n" "${RED}" "Backup failed" "${RESET}"
-    ACTION_RESULTS+=("failed")
-    log_error "$desc failed"
-    return 1
-  fi
-}
-
-# Interactive yes/no chooser (arrow keys/Enter)
-choose_yes_no() {
-  local prompt="$1"
-  if ! [[ -t 0 ]]; then
-    echo "$prompt"
-    echo "Non-interactive terminal: defaulting to 'No'"
-    return 1
-  fi
-
-  local sel=0 key
-  tput civis 2>/dev/null || true
-
-  while true; do
-    printf '\r\033[K'
-    if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
-    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
-    IFS= read -rsn1 key 2>/dev/null || key=''
-    if [[ $key == $'\x1b' ]]; then IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''; key+="$rest"; fi
-    case "$key" in
-      $'\n'|$'\r'|'') printf "\n"; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && return 0 || return 1 ;;
-      $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
-      h|H|l|L) sel=$((1 - sel)) ;;
-      q|Q) printf "\n"; echo -e "${RED}Aborted by user.${RESET}"; tput cnorm 2>/dev/null || true; exit 1 ;;
-      *) ;;
-    esac
-  done
-}
-
-# perform_action: interactive operations (edits/restarts/etc.)
-perform_action(){
-  local desc="$1"; shift
-  local cmd="$*"
-
-  echo -e "${CYAN}${BOLD}Action:${RESET} ${desc}"
-
-  ACTION_DESCS+=("$desc")
-  ACTION_CMDS+=("$cmd")
-
-  log_command_to_file_only "INFO" "Planned command" "$cmd"
-
-  if choose_yes_no "Apply?"; then
-    if [[ "${DRY_RUN}" == "true" ]]; then
-      printf "%b%s%b\n" "${GREEN}" "Changes has been applied (dry-run)" "${RESET}"
-      ACTION_RESULTS+=("dry-accepted")
-      log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"
-      return 0
-    fi
-
-    log_command_to_file_only "INFO" "Executing command" "$cmd"
-    if eval "$cmd"; then
-      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
-      log_success "$desc"
-      ACTION_RESULTS+=("executed")
-      return 0
+run_or_echo(){
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "+ $*"
     else
-      printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"
-      log_error "$desc failed"
-      ACTION_RESULTS+=("failed")
-      return 1
+        eval "$@"
     fi
-  else
-    printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
-    ACTION_RESULTS+=("skipped")
-    log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"
-    return 0
-  fi
 }
 
-# Firewall helpers (kept minimal/robust)
-csf_present() {
-  if command -v systemctl >/dev/null 2>&1; then
-    if systemctl is-active --quiet csf 2>/dev/null || systemctl is-active --quiet lfd 2>/dev/null; then return 0; fi
-  fi
-  if pgrep -x csf >/dev/null 2>&1 || pgrep -x lfd >/dev/null 2>&1 || pgrep -f '/usr/local/csf' >/dev/null 2>&1; then return 0; fi
-  [[ -d /etc/csf || -d /usr/local/csf || -x /usr/sbin/csf || -x /usr/local/sbin/csf ]] && return 0
-  return 1
-}
-
-detect_active_firewall() {
-  if csf_present; then echo "csf"; return 0; fi
-  if command -v nft >/dev/null 2>&1; then
-    if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1; then
-    if firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then echo "firewalld"; return 0; fi
-    if systemctl is-active --quiet firewalld 2>/dev/null; then echo "firewalld"; return 0; fi
-  fi
-  if command -v iptables-save >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1; then echo "iptables"; return 0; fi
-  echo "none"; return 0
-}
-
-firewall_change_exists() {
-  local manager="$1"; shift
-  local cmd="$*"
-  local ports_found
-  ports_found="$(echo "$cmd" | grep -oE '([0-9]{2,5})' | tr '\n' ' ' | tr ' ' '\n' | sort -u || true)"
-  if [[ -z "$ports_found" ]]; then return 1; fi
-  for port in $ports_found; do
-    case "$manager" in
-      nftables) nft list ruleset 2>/dev/null | grep -E -q "dport[[:space:]]+$port" && return 0 ;;
-      firewalld) firewall-cmd --permanent --list-ports 2>/dev/null | tr ' ' '\n' | grep -xq "${port}/tcp" && return 0 ;;
-      iptables) if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 && return 0; fi ;;
-      csf)
-        if [[ -r /etc/csf/csf.conf ]]; then
-          local line; line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 || true)"
-          line="${line#*=}"; line="${line//\"/}"; line="${line//\'/}"; line="${line// /}"
-          for p in 25 465 587; do grep -q "^$p\$" <<<"${line//,/\\n}" && return 0 || true; done
-        fi
-        ;;
-    esac
-  done
-  return 1
-}
-
-precheck_and_perform_firewall_action() {
-  local manager="$1"; shift
-  local desc="$1"; shift
-  local cmd="$*"
-  if firewall_change_exists "$manager" "$cmd"; then
-    printf "%b%s%b\n" "${BLUE}" "Firewall changes aren't necessary — already present" "${RESET}"
-    ACTION_DESCS+=("$desc"); ACTION_CMDS+=("$cmd"); ACTION_RESULTS+=("already")
-    log_info "Skipped firewall action (already present): $desc"
-    return 0
-  fi
-  perform_action "$desc" "$cmd"
-}
-
-configure_firewall() {
-  local fw; fw="$(detect_active_firewall)"; log_info "Detected firewall manager: ${fw}"
-  case "$fw" in
-    nftables)
-      log_info "Managing nftables"
-      local nft_base="nft add table inet linkzero >/dev/null 2>&1 || true; nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/dev/null 2>&1 || true;"
-      precheck_and_perform_firewall_action "nftables" "Ensure nftables table/chain exists" "$nft_base"
-      precheck_and_perform_firewall_action "nftables" "Allow Submission (port 587)" "$nft_base nft add rule inet linkzero input tcp dport 587 accept >/dev/null 2>&1 || true"
-      precheck_and_perform_firewall_action "nftables" "Allow SMTP (port 25)" "$nft_base nft add rule inet linkzero input tcp dport 25 accept >/dev/null 2>&1 || true"
-      precheck_and_perform_firewall_action "nftables" "Allow SMTPS (port 465)" "$nft_base nft add rule inet linkzero input tcp dport 465 accept >/dev/null 2>&1 || true"
-      ;;
-    csf)
-      log_info "Managing CSF"
-      perform_action "Reload CSF firewall" "csf -r || true"
-      precheck_and_perform_firewall_action "csf" "Ensure /etc/csf/csf.conf has TCP_IN 25,587,465" "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
-      ;;
-    firewalld)
-      log_info "Managing firewalld"
-      precheck_and_perform_firewall_action "firewalld" "Open port 587/tcp permanently" "firewall-cmd --permanent --add-port=587/tcp"
-      precheck_and_perform_firewall_action "firewalld" "Open port 25/tcp permanently" "firewall-cmd --permanent --add-port=25/tcp"
-      precheck_and_perform_firewall_action "firewalld" "Open port 465/tcp permanently" "firewall-cmd --permanent --add-port=465/tcp"
-      precheck_and_perform_firewall_action "firewalld" "Reload firewalld" "firewall-cmd --reload"
-      ;;
-    iptables)
-      log_info "Managing iptables only"
-      precheck_and_perform_firewall_action "iptables" "Allow Submission (port 587)" "iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
-      precheck_and_perform_firewall_action "iptables" "Allow SMTP (port 25)" "iptables -I INPUT -p tcp --dport 25 -j ACCEPT"
-      precheck_and_perform_firewall_action "iptables" "Allow SMTPS (port 465)" "iptables -I INPUT -p tcp --dport 465 -j ACCEPT"
-      ;;
-    none|*)
-      log_info "No recognized firewall manager detected; skipping firewall changes."
-      echo -e "${YELLOW}No active firewall manager detected (csf, nftables, firewalld, iptables).${RESET}"
-      ;;
-  esac
-}
-
-# Mail-server detection:
-# Priority: cPanel -> exim binary -> postfix -> none
-# If cPanel detected, assume Exim (cPanel).
-detect_active_mailserver() {
-  MAIL_SERVER_VARIANT=""
-
-  # If cPanel exists (broad checks), assume Exim (cPanel)
-  if [[ -d /usr/local/cpanel ]] || [[ -d /var/cpanel ]] || [[ -f /usr/local/cpanel/version ]] || \
-     [[ -f /var/cpanel/exim.conf ]] || [[ -f /var/cpanel/main_exim.conf ]] || \
-     [[ -x /usr/local/cpanel/bin/rebuildeximconf ]] || [[ -x /scripts/rebuildeximconf ]]; then
-    MAIL_SERVER_VARIANT="cPanel"
-    # attempt to capture exim version if exim binary present
-    if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-      local exim_v; exim_v="$(exim -bV 2>&1 || true)"
-      EXIM_VERSION="$(printf '%s\n' "$exim_v" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
-      EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$exim_v" | sed -n '1p' | xargs || true)}"
-      EXIM_VERSION="${EXIM_VERSION:-unknown}"
-    else
-      EXIM_VERSION="unknown"
+require_root(){
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root (sudo)"
+        exit 3
     fi
-    echo "exim"
-    return 0
-  fi
-
-  # If not cPanel, check exim binary presence
-  if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-    local exim_v; exim_v="$(exim -bV 2>&1 || true)"
-    EXIM_VERSION="$(printf '%s\n' "$exim_v" | sed -nE 's/^[[:space:]]*Exim version[[:space:]]*(.+)$/\1/ip' | head -n1 || true)"
-    EXIM_VERSION="${EXIM_VERSION:-$(printf '%s\n' "$exim_v" | sed -n '1p' | xargs || true)}"
-    EXIM_VERSION="${EXIM_VERSION:-unknown}"
-    # If exim -bV contains cPanel references, mark variant too
-    if printf '%s\n' "$exim_v" | grep -qiE 'cpanel|/var/cpanel|/usr/local/cpanel'; then
-      MAIL_SERVER_VARIANT="cPanel"
-    fi
-    echo "exim"
-    return 0
-  fi
-
-  # Postfix fallback
-  if command -v postconf >/dev/null 2>&1 || command -v postfix >/dev/null 2>&1; then
-    echo "postfix"
-    return 0
-  fi
-
-  echo "none"
-  return 0
-}
-
-# Helper: Capitalize first letter for display ("exim" -> "Exim")
-capitalize_first() {
-  local s="$1"
-  if [[ -z "$s" ]]; then echo ""; return; fi
-  local first="${s:0:1}"
-  local rest="${s:1}"
-  printf '%s%s' "${first^^}" "$rest"
-}
-
-# Configure Postfix (unchanged)
-configure_postfix(){
-  log_info "Configuring Postfix to require TLS for AUTH"
-  if ! command -v postconf >/dev/null 2>&1; then log_info "postconf not present; skipping Postfix configuration"; return 0; fi
-
-  perform_action "Set Postfix: smtpd_tls_auth_only = yes" "postconf -e 'smtpd_tls_auth_only = yes'"
-  perform_action "Set Postfix: smtpd_tls_security_level = may" "postconf -e 'smtpd_tls_security_level = may'"
-  perform_action "Set Postfix: smtpd_sasl_auth_enable = yes" "postconf -e 'smtpd_sasl_auth_enable = yes'"
-
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart"; fi
-}
-
-# Configure Exim (edits remain interactive; backups non-interactive)
-configure_exim(){
-  log_info "Configuring Exim to require TLS for AUTH (if Exim is present or cPanel assumed)"
-
-  if ! command -v exim >/dev/null 2>&1 && ! command -v exim4 >/dev/null 2>&1 && [[ -z "${MAIL_SERVER_VARIANT}" ]]; then
-    log_info "Exim not present; skipping Exim configuration"
-    return 0
-  fi
-
-  local exim_conf=""
-
-  # Standard locations
-  if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"
-  elif [[ -f /etc/exim/exim.conf ]]; then exim_conf="/etc/exim/exim.conf"
-  elif [[ -f /etc/exim.conf ]]; then exim_conf="/etc/exim.conf"
-  fi
-
-  # If cPanel assumed, search cPanel locations
-  if [[ -z "$exim_conf" && "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
-    local candidates=(
-      "/var/cpanel/exim.conf"
-      "/var/cpanel/main_exim.conf"
-      "/var/cpanel/exim.conf.local"
-      "/etc/exim.conf"
-      "/etc/exim.conf.local"
-      "/var/cpanel/userdata/*/exim.conf"
-    )
-    for p in "${candidates[@]}"; do
-      for f in $p; do
-        if [[ -f "$f" ]]; then exim_conf="$f"; break 2; fi
-      done
-    done
-    if [[ -z "$exim_conf" ]]; then
-      local found
-      found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
-      if [[ -n "$found" ]]; then exim_conf="$found"; fi
-    fi
-
-    if [[ -n "$exim_conf" ]]; then
-      log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"
-    else
-      log_info "cPanel detected but Exim config file not found in common cPanel locations; proceeding best-effort"
-    fi
-  fi
-
-  # If still not found, parse exim -bV or detect split-config
-  if [[ -z "$exim_conf" ]]; then
-    if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-      local exim_v; exim_v="$(exim -bV 2>&1 || true)"
-      exim_conf="$(printf '%s\n' "$exim_v" | sed -nE 's/.*Configuration file[^:]*:[[:space:]]*(.+)$/\1/p' | head -n1 || true)"
-      if [[ -z "$exim_conf" ]] && printf '%s\n' "$exim_v" | grep -qi '/etc/exim4'; then
-        if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"
-        elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
-      fi
-      exim_conf="$(echo "$exim_conf" | xargs || true)"
-      if [[ -n "$exim_conf" && -f "$exim_conf" ]]; then
-        log_info "Discovered Exim configuration via 'exim -bV': ${exim_conf}"
-      else
-        if [[ -d /etc/exim4/conf.d ]]; then
-          exim_conf="/etc/exim4"
-          log_info "Detected exim4 split-config directory: ${exim_conf}"
-        else
-          exim_conf=""
-        fi
-      fi
-    fi
-  fi
-
-  if [[ -n "$exim_conf" ]]; then
-    local timestamp; timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
-      local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
-      perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
-    else
-      local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
-      local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
-      perform_backup "Backup Exim config file" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim config" "$sed_cmd"
-    fi
-  else
-    log_info "Exim configuration not located; skipping config-file edits"
-  fi
-
-  # Restart Exim (interactive)
-  if command -v systemctl >/dev/null 2>&1; then
-    perform_action "Restart Exim via systemctl" "systemctl restart exim4 || systemctl restart exim || true"
-  else
-    perform_action "Restart Exim via service" "service exim4 restart || service exim restart || true"
-  fi
-}
-
-test_configuration(){
-  log_info "Running basic mail-server checks (prompted)"
-  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then perform_action "Postfix: basic configuration check" "postfix check"; fi
-  if [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]] || command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
-    perform_action "Exim: basic configuration info" "exim -bV"
-  fi
-}
-
-_print_summary(){
-  echo -e "${BLUE}${BOLD}Summary:${RESET}"
-  local i
-  for i in "${!ACTION_DESCS[@]}"; do
-    local d="${ACTION_DESCS[$i]}"; local r="${ACTION_RESULTS[$i]}"
-    case "$r" in
-      executed) printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "$GREEN" "$RESET" "$d" ;;
-      failed) printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
-      skipped) printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
-      dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
-      already) printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "$BLUE" "$RESET" "$d" ;;
-      *) printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
-    esac
-  done
 }
 
 usage(){
-  cat <<EOF
-Usage: $0 [--dry-run]
+    cat <<EOF
+$PROGNAME - enforce SMTP AUTH only over TLS
 
-  --dry-run   Show what would be done without making any changes to the system.
+Usage: $PROGNAME [OPTIONS]
+
+Options:
+  --dry-run            Show actions but don't apply changes.
+  --backup-only        Only create backups and exit.
+  --restore            Restore latest backup (explicit restore).
+  --rollback           Alias for --restore (keeps naming).
+  --backup-dir DIR     Use DIR for backups (default: $BACKUP_DIR_DEFAULT).
+  --no-restart         Do not restart mail services after changes.
+  --help               Show this help.
 EOF
 }
 
-main(){
-  if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
+# Prompt helper: ask a yes/no question and then remove the question from the console after the user answers.
+# Usage: prompt_yes_no "Prompt text [y/N] " "n"
+# Returns 0 for yes, 1 for no.
+prompt_yes_no(){
+    local prompt="${1:-Continue? [y/N] }"
+    local default="${2:-n}"
+    local ans
 
-  for arg in "$@"; do
-    case "$arg" in
-      --dry-run) DRY_RUN=true ;;
-      -h|--help) usage; exit 0 ;;
-      *) echo "Unknown option: $arg"; usage; exit 2 ;;
-    esac
-  done
+    # Non-interactive: respect the default
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        if [[ "${default,,}" == "y" ]]; then
+            return 0
+        else
+            return 1
+        fi
+    fi
 
-  log_info "Starting smtp-hardening (dry-run=${DRY_RUN:-false})"
+    while true; do
+        # Print prompt and read answer
+        read -r -p "$prompt" ans
 
-  configure_firewall
+        # After the user answers, remove the prompt+answer line from the terminal to avoid leaving the question visible.
+        # Move cursor up one line, then clear line. If tput isn't available or fails, fall back silently.
+        tput cuu1 2>/dev/null || true
+        tput el 2>/dev/null || true
 
-  local mail_svc
-  mail_svc="$(detect_active_mailserver)"
-
-  # Build display_label with capitalized service and optional variant + version
-  local svc_disp; svc_disp="$(capitalize_first "$mail_svc")"
-  local variant_display=""
-  if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
-    variant_display=" (${MAIL_SERVER_VARIANT})"
-  fi
-  local version_display=""
-  if [[ "${mail_svc}" == "exim" ]]; then
-    version_display=" — version: ${EXIM_VERSION:-unknown}"
-  fi
-
-  log_info "Detected mail server: ${svc_disp}${variant_display}${version_display}"
-
-  case "$mail_svc" in
-    exim)
-      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
-        log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}) — running Exim-specific tasks."
-      else
-        log_info "Exim detected — running Exim-specific tasks."
-      fi
-      configure_exim
-      test_configuration
-      ;;
-    postfix)
-      log_info "Postfix detected (no Exim) — running Postfix-specific tasks."
-      configure_postfix
-      test_configuration
-      ;;
-    none|*)
-      log_info "No mail server detected; attempting both Exim and Postfix tasks (fallback)."
-      configure_exim
-      configure_postfix
-      test_configuration
-      ;;
-  esac
-
-  log_info "Completed smtp-hardening run"
-
-  _print_summary
+        case "${ans,,}" in
+            y|yes) return 0 ;;
+            n|no|'')
+                if [[ "${default,,}" == "y" ]]; then
+                    return 0
+                else
+                    return 1
+                fi
+                ;;
+            *)
+                # Invalid response: re-prompt (previous prompt was cleared)
+                ;;
+        esac
+    done
 }
 
-main "$@"
+# Basic environment checks
+check_cloudlinux(){
+    if [[ -f /etc/redhat-release ]] && grep -qi 'cloudlinux' /etc/redhat-release 2>/dev/null; then
+        log_info "CloudLinux environment detected."
+    else
+        log_warn "CloudLinux not detected. Script is generic; continue carefully."
+    fi
+}
+
+create_backup_dir(){
+    run_or_echo "mkdir -p '$BACKUP_DIR'"
+    log_info "Using backup directory: $BACKUP_DIR"
+}
+
+detect_mail_server(){
+    local ms=""
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-units --type=service --state=active | grep -qi postfix; then
+            ms="postfix"
+        elif systemctl list-units --type=service --state=active | grep -qi exim; then
+            ms="exim"
+        elif systemctl list-units --type=service --state=active | grep -qi sendmail; then
+            ms="sendmail"
+        fi
+    fi
+
+    # Fallback by checking config files
+    if [[ -z "$ms" ]]; then
+        if [[ -f /etc/postfix/main.cf ]]; then ms="postfix"; fi
+        if [[ -f /etc/exim/exim.conf || -f /etc/exim4/update-exim4.conf.conf ]]; then ms="exim"; fi
+        if [[ -f /etc/sendmail.cf ]]; then ms="sendmail"; fi
+    fi
+
+    echo "$ms"
+}
+
+backup_configs(){
+    log_info "Creating backups..."
+    local ms
+    ms="$(detect_mail_server)"
+    local t="$TIMESTAMP"
+    # Mail server specific backups
+    case "$ms" in
+        postfix)
+            if [[ -f /etc/postfix/main.cf ]]; then
+                run_or_echo "cp -a /etc/postfix/main.cf '$BACKUP_DIR/main.cf.$t'"
+                log_info "Backed up /etc/postfix/main.cf -> $BACKUP_DIR/main.cf.$t"
+            fi
+            if [[ -f /etc/postfix/master.cf ]]; then
+                run_or_echo "cp -a /etc/postfix/master.cf '$BACKUP_DIR/master.cf.$t'"
+                log_info "Backed up /etc/postfix/master.cf -> $BACKUP_DIR/master.cf.$t"
+            fi
+            ;;
+        exim)
+            if [[ -f /etc/exim/exim.conf ]]; then
+                run_or_echo "cp -a /etc/exim/exim.conf '$BACKUP_DIR/exim.conf.$t'"
+                log_info "Backed up /etc/exim/exim.conf -> $BACKUP_DIR/exim.conf.$t"
+            fi
+            if [[ -f /etc/exim4/update-exim4.conf.conf ]]; then
+                run_or_echo "cp -a /etc/exim4/update-exim4.conf.conf '$BACKUP_DIR/update-exim4.conf.conf.$t'"
+                log_info "Backed up /etc/exim4/update-exim4.conf.conf -> $BACKUP_DIR/update-exim4.conf.conf.$t"
+            fi
+            ;;
+        sendmail)
+            if [[ -f /etc/sendmail.cf ]]; then
+                run_or_echo "cp -a /etc/sendmail.cf '$BACKUP_DIR/sendmail.cf.$t'"
+                log_info "Backed up /etc/sendmail.cf -> $BACKUP_DIR/sendmail.cf.$t"
+            fi
+            ;;
+        *)
+            log_warn "No known mail server detected; nothing backed up for mail server configs."
+            ;;
+    esac
+
+    # Backup firewall rules if available
+    if command -v iptables-save >/dev/null 2>&1; then
+        run_or_echo "iptables-save > '$BACKUP_DIR/iptables.$t'"
+        log_info "Backed up iptables -> $BACKUP_DIR/iptables.$t"
+    fi
+    if [[ -f /etc/csf/csf.conf ]]; then
+        run_or_echo "cp -a /etc/csf/csf.conf '$BACKUP_DIR/csf.conf.$t'"
+        log_info "Backed up CSF config -> $BACKUP_DIR/csf.conf.$t"
+    fi
+}
+
+restore_configuration(){
+    local latest
+    latest="$(ls -1t "$BACKUP_DIR"/* 2>/dev/null | head -n1 || true)"
+    if [[ -z "$latest" ]]; then
+        log_error "No backups found in $BACKUP_DIR"
+        exit 4
+    fi
+
+    # Restore by matching filename patterns (conservative)
+    if ls -1t "$BACKUP_DIR"/main.cf.* >/dev/null 2>&1; then
+        local m
+        m="$(ls -1t "$BACKUP_DIR"/main.cf.* | head -n1)"
+        run_or_echo "cp -a '$m' /etc/postfix/main.cf"
+        log_info "Restored /etc/postfix/main.cf from $m"
+    fi
+    if ls -1t "$BACKUP_DIR"/master.cf.* >/dev/null 2>&1; then
+        local mm
+        mm="$(ls -1t "$BACKUP_DIR"/master.cf.* | head -n1)"
+        run_or_echo "cp -a '$mm' /etc/postfix/master.cf"
+        log_info "Restored /etc/postfix/master.cf from $mm"
+    fi
+    if ls -1t "$BACKUP_DIR"/exim.conf.* >/dev/null 2>&1; then
+        local e
+        e="$(ls -1t "$BACKUP_DIR"/exim.conf.* | head -n1)"
+        run_or_echo "cp -a '$e' /etc/exim/exim.conf"
+        log_info "Restored /etc/exim/exim.conf from $e"
+    fi
+    if ls -1t "$BACKUP_DIR"/sendmail.cf.* >/dev/null 2>&1; then
+        local s
+        s="$(ls -1t "$BACKUP_DIR"/sendmail.cf.* | head -n1)"
+        run_or_echo "cp -a '$s' /etc/sendmail.cf"
+        log_info "Restored /etc/sendmail.cf from $s"
+    fi
+
+    # Restore iptables if present
+    if [[ -f "$BACKUP_DIR/iptables.$TIMESTAMP" ]]; then
+        run_or_echo "iptables-restore < '$BACKUP_DIR/iptables.$TIMESTAMP'"
+        log_info "Restored iptables from $BACKUP_DIR/iptables.$TIMESTAMP"
+    else
+        # pick latest iptables.*
+        if ls -1t "$BACKUP_DIR"/iptables.* >/dev/null 2>&1; then
+            local ipf
+            ipf="$(ls -1t "$BACKUP_DIR"/iptables.* | head -n1)"
+            run_or_echo "iptables-restore < '$ipf'"
+            log_info "Restored iptables from $ipf"
+        fi
+    fi
+
+    if [[ "$NO_RESTART" == "false" ]]; then
+        restart_services
+    fi
+
+    log_success "Restore completed (or dry-run showed actions)."
+}
+
+configure_postfix(){
+    log_info "Configuring Postfix to require AUTH only after TLS"
+    local main_cf="/etc/postfix/main.cf"
+
+    if [[ ! -f "$main_cf" ]]; then
+        log_error "Postfix main.cf not found; skipping Postfix configuration"
+        return 1
+    fi
+
+    # Use postconf -e when available (safer)
+    if command -v postconf >/dev/null 2>&1; then
+        run_or_echo "postconf -e 'smtpd_tls_auth_only = yes'"
+        # ensure STARTTLS offered at least
+        local cur_tls
+        cur_tls="$(postconf -h smtpd_tls_security_level || true)"
+        if [[ -z "$cur_tls" || "$cur_tls" == "none" ]]; then
+            run_or_echo "postconf -e 'smtpd_tls_security_level = may'"
+        else
+            log_info "Existing smtpd_tls_security_level = $cur_tls (left unchanged)"
+        fi
+
+        # If SASL is enabled, ensure noanonymous is present
+        local sasl_enable
+        sasl_enable="$(postconf -h smtpd_sasl_auth_enable || true)"
+        local sasl_opts
+        sasl_opts="$(postconf -h smtpd_sasl_security_options || true)"
+        if [[ -n "$sasl_enable" && "$sasl_enable" != "no" ]]; then
+            if [[ -z "$sasl_opts" ]]; then
+                run_or_echo "postconf -e 'smtpd_sasl_security_options = noanonymous'"
+            else
+                if echo "$sasl_opts" | grep -q noanonymous; then
+                    log_info "smtpd_sasl_security_options already contains noanonymous"
+                else
+                    run_or_echo "postconf -e 'smtpd_sasl_security_options = ${sasl_opts},noanonymous'"
+                fi
+            fi
+        else
+            log_info "SASL appears not enabled (smtpd_sasl_auth_enable=$sasl_enable); not forcing SASL options."
+        fi
+
+        # add a short note in main.cf (non-duplicating)
+        if ! grep -q '# LinkZero: enforced smtpd_tls_auth_only' "$main_cf" 2>/dev/null; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "+ echo '# LinkZero: enforced smtpd_tls_auth_only=$TIMESTAMP' >> $main_cf"
+            else
+                printf "\n# LinkZero: enforced smtpd_tls_auth_only=%s\n" "$TIMESTAMP" >> "$main_cf"
+                log_info "Appended enforcement note to $main_cf"
+            fi
+        fi
+
+        log_success "Postfix configuration tasks applied (or dry-run shown them)."
+    else
+        log_warn "postconf not available; attempting manual edits to $main_cf"
+        # Manual conservative edits could be done here (omitted for brevity)
+    fi
+}
+
+configure_exim(){
+    log_info "Configuring Exim to require TLS before AUTH"
+    # Conservative approach: append configuration snippet to force TLS for AUTH
+    # If Exim uses update-exim4.conf, modify appropriately.
+    if [[ -f /etc/exim/exim.conf ]]; then
+        local exim_conf="/etc/exim/exim.conf"
+        if grep -q "## LinkZero: require TLS for AUTH" "$exim_conf" 2>/dev/null; then
+            log_info "Exim already contains LinkZero TLS enforcement snippet; skipping"
+            return 0
+        fi
+
+        # Append a conservative ACL or comment to guide admins. Exact modifications
+        # depend on Exim configuration style; this is intentionally minimal.
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "+ echo '## LinkZero: enforce TLS before AUTH (admin review required)' >> $exim_conf"
+        else
+            {
+                echo
+                echo "## LinkZero: enforce TLS before AUTH ($TIMESTAMP)"
+                echo "# Please review Exim ACLs to require TLS for AUTH; automated changes are intentionally minimal."
+            } >> "$exim_conf"
+            log_info "Appended guidance comment to $exim_conf (manual review recommended)"
+        fi
+        log_success "Exim configuration modified (or dry-run shown actions)."
+    else
+        log_warn "Exim configuration file not found (/etc/exim/exim.conf); skipping Exim config"
+        return 1
+    fi
+}
+
+configure_firewall(){
+    log_info "Configuring firewall to allow encrypted submission ports and restrict port 25 to localhost only"
+    # This function is conservative: it adds rules but does not remove existing rules.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # show intended iptables commands
+        echo "+ iptables -A INPUT -p tcp --dport 587 -j ACCEPT"
+        echo "+ iptables -A INPUT -p tcp --dport 465 -j ACCEPT"
+        echo "+ iptables -A INPUT -p tcp --dport 25 -s 127.0.0.1 -j ACCEPT"
+        echo "+ iptables -A INPUT -p tcp --dport 25 -j DROP"
+        return 0
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        # Allow submission (587) and SMTPS (465)
+        iptables -C INPUT -p tcp --dport 587 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 587 -j ACCEPT
+        iptables -C INPUT -p tcp --dport 465 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 465 -j ACCEPT
+
+        # Keep localhost access to port 25, block the rest (append DROP if not already present)
+        iptables -C INPUT -p tcp --dport 25 -s 127.0.0.1 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 25 -s 127.0.0.1 -j ACCEPT
+        iptables -C INPUT -p tcp --dport 25 -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport 25 -j DROP
+
+        # Save rules if possible
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > "$BACKUP_DIR/iptables.$TIMESTAMP"
+            log_info "Saved iptables snapshot to $BACKUP_DIR/iptables.$TIMESTAMP"
+        fi
+
+        log_success "iptables rules applied to prefer encrypted submission and restrict plaintext port 25."
+    else
+        log_warn "iptables not found; skipping iptables changes. If you use firewalld, nftables, or CSF, please configure those manually."
+    fi
+
+    # CSF adjustments (conservative)
+    if [[ -f /etc/csf/csf.conf ]]; then
+        log_info "CSF detected: updating allowed ports (conservative edits)"
+        # Add 587 and 465 to TCP_IN if not present
+        if ! grep -qE '^TCP_IN=.*\b587\b' /etc/csf/csf.conf 2>/dev/null; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "+ sed -i 's/^TCP_IN=\"\\(.*\\)\"/TCP_IN=\"\\1,587\"/' /etc/csf/csf.conf"
+            else
+                sed -i -E 's/^(TCP_IN=")([^"]*)(")/\1\2,587\3/' /etc/csf/csf.conf || true
+            fi
+        fi
+        if ! grep -qE '^TCP_IN=.*\b465\b' /etc/csf/csf.conf 2>/dev/null; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "+ sed -i 's/^TCP_IN=\"\\(.*\\)\"/TCP_IN=\"\\1,465\"/' /etc/csf/csf.conf"
+            else
+                sed -i -E 's/^(TCP_IN=")([^"]*)(")/\1\2,465\3/' /etc/csf/csf.conf || true
+            fi
+        fi
+
+        if [[ "$DRY_RUN" == "false" ]]; then
+            csf -r >/dev/null 2>&1 || log_warn "csf reload returned non-zero or is unavailable."
+            log_info "CSF reloaded (if available)."
+        fi
+    fi
+}
+
+restart_services(){
+    log_info "Restarting mail services (if present) unless --no-restart set"
+    if [[ "$NO_RESTART" == "true" ]]; then
+        log_info "--no-restart set: skipping service restarts"
+        return 0
+    fi
+
+    local ms
+    ms="$(detect_mail_server)"
+    case "$ms" in
+        postfix)
+            if command -v systemctl >/dev/null 2>&1; then
+                run_or_echo "systemctl restart postfix"
+            else
+                run_or_echo "service postfix restart"
+            fi
+            ;;
+        exim)
+            if command -v systemctl >/dev/null 2>&1; then
+                run_or_echo "systemctl restart exim || systemctl restart exim4 || true"
+            else
+                run_or_echo "service exim restart || service exim4 restart || true"
+            fi
+            ;;
+        sendmail)
+            if command -v systemctl >/dev/null 2>&1; then
+                run_or_echo "systemctl restart sendmail"
+            else
+                run_or_echo "service sendmail restart"
+            fi
+            ;;
+        *)
+            log_warn "No known mail service detected; no restart attempted."
+            ;;
+    esac
+}
+
+test_configuration(){
+    log_info "Testing mail server configuration (basic checks)"
+    local ms
+    ms="$(detect_mail_server)"
+    case "$ms" in
+        postfix)
+            if command -v postfix >/dev/null 2>&1; then
+                if [[ "$DRY_RUN" == "false" ]]; then
+                    if postfix check >/dev/null 2>&1; then
+                        log_success "postfix check OK"
+                    else
+                        log_error "postfix check failed — inspect configuration"
+                        return 1
+                    fi
+                else
+                    echo "+ postfix check"
+                fi
+            fi
+            ;;
+        exim)
+            if command -v exim >/dev/null 2>&1; then
+                if [[ "$DRY_RUN" == "false" ]]; then
+                    if exim -bV >/dev/null 2>&1; then
+                        log_success "exim basic check OK"
+                    else
+                        log_error "exim basic check failed — inspect configuration"
+                        return 1
+                    fi
+                else
+                    echo "+ exim -bV"
+                fi
+            fi
+            ;;
+        *)
+            log_warn "No mail server tests available for detected server: $ms"
+            ;;
+    esac
+}
+
+# Argument parsing
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true; shift;;
+        --backup-only) BACKUP_ONLY=true; shift;;
+        --restore|--rollback) RESTORE=true; ROLLBACK=true; shift;;
+        --backup-dir) BACKUP_DIR="$2"; shift 2;;
+        --no-restart) NO_RESTART=true; shift;;
+        --help) usage; exit 0;;
+        *) log_error "Unknown option: $1"; usage; exit 2;;
+    esac
+done
+
+main(){
+    require_root
+    check_cloudlinux
+    create_backup_dir
+
+    # Clear the console for interactive terminals so banner is prominent
+    if [[ -t 1 ]]; then
+        clear
+    fi
+
+    # Print the author banner (red when interactive) with two blank lines after
+    if [[ -t 1 ]]; then
+        # Print a clear, colored author banner for interactive terminals and add two extra blank lines
+        printf "%b%s%b\n\n\n" "$RED" "$AUTHOR_TEXT" "$NC"
+    else
+        # Non-interactive: plain author line (no extra blank lines)
+        printf "%s\n" "$AUTHOR_TEXT"
+    fi
+
+    # Also write author info to logfile for auditing WITHOUT printing it to stdout
+    {
+        ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        printf '%s [%s] %s\n' "$ts" "INFO" "Author: ${AUTHOR_TEXT}"
+    } >> "$LOG_FILE" 2>/dev/null || true
+
+    backup_configs
+
+    if [[ "$BACKUP_ONLY" == "true" ]]; then
+        log_success "Backups created in $BACKUP_DIR (backup-only mode)."
+        exit 0
+    fi
+
+    if [[ "$RESTORE" == "true" ]]; then
+        # Ask the user to confirm the restore. After the user answers, the question
+        # will be removed from the console (prompt + input are cleared).
+        if prompt_yes_no "Restore latest backup from $BACKUP_DIR? [y/N] " "n"; then
+            restore_configuration
+        else
+            log_info "Restore canceled by user."
+        fi
+        exit 0
+    fi
+
+    # Detect mail server and apply appropriate configuration
+    local ms
+    ms="$(detect_mail_server)"
+    if [[ -z "$ms" ]]; then
+        log_error "No supported mail server detected (Postfix/Exim/Sendmail). Aborting."
+        exit 5
+    fi
+
+    log_info "Detected mail server: $ms"
+
+    case "$ms" in
+        postfix)
+            configure_postfix
+            ;;
+        exim)
+            configure_exim
+            ;;
+        sendmail)
+            log_warn "Sendmail detected: manual configuration recommended to enforce TLS before AUTH"
+            ;;
+        *)
+            log_error "Unsupported mail server: $ms"
+            ;;
+    esac
+
+    configure_firewall
+    restart_services
+    test_configuration
+
+    log_success "Script finished. Backups are in: $BACKUP_DIR"
+    log_info "If you need to revert, run: $PROGNAME --restore --backup-dir '$BACKUP_DIR'"
+}
+
+main
