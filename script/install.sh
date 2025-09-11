@@ -37,41 +37,6 @@ AUTHOR_TEXT=" a u t h o r :    D A N I E L    N O W A K O W S K I"
 # Print the author line initially in RED (fallback)
 # Note: we print it normally (with newline) so the layout stays the same.
 echo -e "${RED}${BOLD}${AUTHOR_TEXT}${NC}"
-
-# Start rainbow animation anchored to the already-printed AUTHOR_TEXT line immediately,
-# before printing the subsequent separator lines. This prevents the animator from
-# probing the cursor position later (after other prints) which caused a duplicate line.
-try_open_tty || true
-start_rainbow_author() {
-    # This variant assumes the author line was just printed and the cursor is on the next line.
-    # It will move up one line, query the position, then move back down and start the animator.
-    if [[ "$USE_TTY_FD" != true ]]; then
-        return 1
-    fi
-    open_io
-    if [[ -z "$INPUT_FD" || -z "$OUTPUT_PATH" ]]; then
-        return 1
-    fi
-
-    # Move up to the author line (we just printed it), query position, then move back down.
-    printf '\033[1A' >"$OUTPUT_PATH" 2>/dev/null || true
-    local pos
-    pos="$(get_cursor_pos)" || {
-        printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true
-        return 1
-    }
-    printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true
-
-    AUTHOR_ROW="${pos%;*}"
-    AUTHOR_COL="${pos#*;}"
-    animate_author "$AUTHOR_ROW" "$AUTHOR_COL" >/dev/null 2>&1 &
-    ANIM_PID=$!
-    trap 'kill_animator' EXIT
-    return 0
-}
-# Call the helper we've defined above to actually start the animation now.
-start_rainbow_author || true
-
 echo -e "${BLUE}========================================================"
 echo -e "        QHTL Zero Configurator SMTP Hardening    "
 echo -e "========================================================${NC}"
@@ -276,8 +241,10 @@ animate_author() {
     done
 }
 
-start_rainbow_author_probe() {
-    # Fallback start function (not used in the new flow) — kept for compatibility.
+# Start rainbow animation anchored to the already-printed AUTHOR_TEXT line.
+# This function will not create a new author line; it finds the existing one and animates it in-place.
+start_rainbow_author() {
+    # Only start if we have a real tty to interact with
     if [[ "$USE_TTY_FD" != true ]]; then
         return 1
     fi
@@ -285,19 +252,25 @@ start_rainbow_author_probe() {
     if [[ -z "$INPUT_FD" || -z "$OUTPUT_PATH" ]]; then
         return 1
     fi
-    # Move up to the author line (we assume it has been printed earlier), query position and move back.
-    printf '\033[1A' >"$OUTPUT_PATH" 2>/dev/null || true
+
+    # The AUTHOR_TEXT was printed above with a newline. To get the cursor position
+    # of that printed line we move the terminal cursor up one line, query position,
+    # then move the cursor back down — this avoids creating or printing another author line.
+    printf '\033[1A' >"$OUTPUT_PATH" 2>/dev/null || true   # move up to author line
     local pos
     pos="$(get_cursor_pos)" || {
+        # If we can't get cursor pos, restore position and bail out gracefully
         printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true
         return 1
     }
-    printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true
+    printf '\033[1B' >"$OUTPUT_PATH" 2>/dev/null || true   # move back to original spot
 
     AUTHOR_ROW="${pos%;*}"
     AUTHOR_COL="${pos#*;}"
+    # Start animator in background, detached from job control
     animate_author "$AUTHOR_ROW" "$AUTHOR_COL" >/dev/null 2>&1 &
     ANIM_PID=$!
+    # Ensure we try to kill background children and restore cursor on exit
     trap 'kill_animator' EXIT
     return 0
 }
@@ -470,6 +443,10 @@ if [[ "$CAN_MENU" != true ]]; then
     exec 3<&- 2>/dev/null || true
     exit 0
 fi
+
+# Start rainbow animation for the already-printed author line (only if we have a tty)
+try_open_tty || true
+start_rainbow_author || true
 
 # Numeric-style interactive main menu loop
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
