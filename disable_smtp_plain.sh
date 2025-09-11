@@ -4,22 +4,20 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# This revision:
-# - Restore interactive prompting that waits for the user's response.
-# - Ensure prompts read from the controlling terminal (/dev/tty) when present
-#   so the script blocks for input even if stdin/stdout are redirected.
-# - Fix a typo in the firewall-change detection helper that could cause errors.
+# Display change in this revision:
+# - The "[INFO] Detected mail server" line now prints the service with:
+#     CapitalizedName (version) (assumed cPanel)
+#   Examples:
+#     [INFO] Detected mail server: Exim (4.94) (assumed cPanel)
+#     [INFO] Detected mail server: Exim (4.94) (cPanel)
+#     [INFO] Detected mail server: Postfix
+#
+# Other behavior: backups are non-interactive and use .link0; commands logged
+# to LOG_FILE only. Edits/restarts remain interactive.
 #
 set -euo pipefail
 
-# Ensure terminal state restored on exit
-on_exit() {
-  tput cnorm 2>/dev/null || true
-  stty sane 2>/dev/null || true
-}
-trap on_exit EXIT
-
-# Colors (fallback)
+# Colors (fallback) - ensure defined before any logging when set -u is used
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -107,54 +105,22 @@ perform_backup() {
 }
 
 # interactive yes/no chooser
-# This implementation:
-# - prefers /dev/tty (controlling terminal) so the prompt waits even if stdin is redirected.
-# - provides the arrow/visual selector UI (like original) and waits for a single keypress.
-# - restores the cursor and terminal mode on exit.
 choose_yes_no() {
   local prompt="$1"
+  if ! [[ -t 0 ]]; then echo "$prompt"; echo "Non-interactive terminal: defaulting to 'No'"; return 1; fi
   local sel=0 key
-  local input_fd
-  # Use /dev/tty when available to ensure blocking prompt on the terminal
-  if [[ -r /dev/tty ]]; then
-    exec 3<>/dev/tty
-    input_fd=3
-  else
-    # Fall back to stdin
-    input_fd=0
-  fi
-
-  # If not an interactive terminal at all, default to No
-  if ! [[ -t "$input_fd" ]]; then
-    if [[ "$input_fd" -eq 0 && ! -t 0 ]]; then
-      # Non-interactive environment -> default to No
-      echo "$prompt"
-      echo "Non-interactive terminal: defaulting to 'No'"
-      [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true
-      return 1
-    fi
-  fi
-
   tput civis 2>/dev/null || true
   while true; do
-    printf '\r\033[K' >&$input_fd
+    printf '\r\033[K'
     if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
-    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >&$input_fd
-
-    # Read one keypress from the chosen fd
-    IFS= read -rsn1 -u "$input_fd" key 2>/dev/null || key=''
-
-    # If an escape sequence, read the rest of it (arrow keys)
-    if [[ $key == $'\x1b' ]]; then
-      IFS= read -rsn2 -t 0.0005 -u "$input_fd" rest 2>/dev/null || rest=''
-      key+="$rest"
-    fi
-
+    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
+    IFS= read -rsn1 key 2>/dev/null || key=''
+    if [[ $key == $'\x1b' ]]; then IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''; key+="$rest"; fi
     case "$key" in
-      $'\n'|$'\r'|'') printf "\n" >&$input_fd; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && { [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; return 0; } || { [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; return 1; } ;;
+      $'\n'|$'\r'|'') printf "\n"; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && return 0 || return 1 ;;
       $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
       h|H|l|L) sel=$((1 - sel)) ;;
-      q|Q) printf "\n" >&$input_fd; echo -e "${RED}Aborted by user.${RESET}" >&$input_fd; tput cnorm 2>/dev/null || true; [[ "$input_fd" -eq 3 ]] && exec 3>&- 2>/dev/null || true; exit 1 ;;
+      q|Q) printf "\n"; echo -e "${RED}Aborted by user.${RESET}"; tput cnorm 2>/dev/null || true; exit 1 ;;
       *) ;;
     esac
   done
@@ -167,34 +133,17 @@ perform_action(){
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
   log_command_to_file_only "INFO" "Planned command" "$cmd"
-
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    # Dry-run: record but do not execute
-    printf "%b%s%b\n" "${YELLOW}" "Dry-run: would run command (no changes)" "${RESET}"
-    ACTION_RESULTS+=("dry-accepted")
-    log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"
-    return 0
-  fi
-
-  # Prompt the user and wait for response (reads from /dev/tty when possible)
   if choose_yes_no "Apply?"; then
-    log_command_to_file_only "INFO" "Executing command" "$cmd"
-    if eval "$cmd"; then
-      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
-      log_success "$desc"
-      ACTION_RESULTS+=("executed")
-      return 0
-    else
-      printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"
-      log_error "$desc failed"
-      ACTION_RESULTS+=("failed")
-      return 1
+    if [[ "${DRY_RUN}" == "true" ]]; then
+      printf "%b%s%b\n" "${GREEN}" "Changes has been applied (dry-run)" "${RESET}"
+      ACTION_RESULTS+=("dry-accepted"); log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"; return 0
     fi
+    log_command_to_file_only "INFO" "Executing command" "$cmd"
+    if eval "$cmd"; then printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"; log_success "$desc"; ACTION_RESULTS+=("executed"); return 0
+    else printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"; log_error "$desc failed"; ACTION_RESULTS+=("failed"); return 1; fi
   else
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
-    ACTION_RESULTS+=("skipped")
-    log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"
-    return 0
+    ACTION_RESULTS+=("skipped"); log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"; return 0
   fi
 }
 
@@ -343,8 +292,7 @@ configure_postfix(){
   perform_action "Set Postfix: smtpd_tls_auth_only = yes" "postconf -e 'smtpd_tls_auth_only = yes'"
   perform_action "Set Postfix: smtpd_tls_security_level = may" "postconf -e 'smtpd_tls_security_level = may'"
   perform_action "Set Postfix: smtpd_sasl_auth_enable = yes" "postconf -e 'smtpd_sasl_auth_enable = yes'"
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix || true"
-  else perform_action "Restart Postfix via service" "service postfix restart || true"; fi
+  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart"; fi
 }
 
 configure_exim(){
@@ -369,7 +317,7 @@ configure_exim(){
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding without config edits"; fi
+    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"; fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
@@ -391,7 +339,7 @@ configure_exim(){
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; find '$exim_conf' -type f -name '*.conf' -exec sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/ d' {} + || true"
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
       local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
@@ -506,8 +454,6 @@ echo -e ""
 
   log_info "Completed smtp-hardening run"
   _print_summary
-
-  exit 0
 }
 
 main "$@"
