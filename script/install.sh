@@ -3,10 +3,13 @@
 # LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
 # Changes:
-# - dry mode now runs the installed program with --dry-run (does NOT remove the file).
-# - dry-run runs attached to /dev/tty when possible so you can observe program output.
-# - installer process is never replaced by exec; programs are launched in subshells or background.
-# - Uninstall removes the file and returns to the main menu.
+# - Removed "background" pre-autostart option.
+# - Pre-autostart choices are now:
+#     1) launch
+#     2) dry   (run installed binary with --dry-run)
+#     3) none  (do NOT start program after install)  <-- returns to main menu
+# - If the user selects "none" after install, the installer returns to the main menu.
+# - dry mode runs the binary with --dry-run attached to /dev/tty when possible.
 #
 set -euo pipefail
 
@@ -171,7 +174,7 @@ download_script_to_temp() {
     fi
 }
 
-# Pre-autostart numeric menu (1-4)
+# Pre-autostart numeric menu (3 options: launch, dry, none)
 choose_prelaunch_mode() {
     open_io
 
@@ -184,16 +187,14 @@ choose_prelaunch_mode() {
     printf "\n" >"$OUTPUT_PATH"
     printf "%b\n" "${ORANGE}Select what should happen after installation for this run:${NC}" >"$OUTPUT_PATH"
     printf " 1) launch     - start program in foreground after countdown\n" >"$OUTPUT_PATH"
-    printf " 2) background - start program in background after countdown\n" >"$OUTPUT_PATH"
-    printf " 3) none       - do NOT start program after install\n" >"$OUTPUT_PATH"
-    printf " 4) dry        - run installed binary with --dry-run (do NOT start normally)\n" >"$OUTPUT_PATH"
+    printf " 2) dry        - run installed binary with --dry-run (do NOT start normally)\n" >"$OUTPUT_PATH"
+    printf " 3) none       - do NOT start program after install (return to main menu)\n" >"$OUTPUT_PATH"
     printf "\n" >"$OUTPUT_PATH"
-    read_line choice "Choose [1-4] (default=1): "
+    read_line choice "Choose [1-3] (default=1): "
     choice="${choice%%[[:space:]]*}"
     case "$choice" in
-        2) printf "background" ;;
+        2) printf "dry" ;;
         3) printf "none" ;;
-        4) printf "dry" ;;
         *) printf "launch" ;;
     esac
 }
@@ -233,21 +234,13 @@ countdown_and_apply_mode() {
             printf "%b\n" "${YELLOW}Autostart disabled for this run; not launching.${NC}" >"$out"
             return 0
             ;;
-        background)
-            if [[ ! -x "$install_path" ]]; then
-                printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
-                return 0
-            fi
-            printf "%b\n" "${GREEN}Starting ${install_path} in background${NC}" >"$out"
-            nohup "$install_path" >/dev/null 2>&1 &
-            return 0
-            ;;
         launch)
             if [[ ! -x "$install_path" ]]; then
                 printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
                 return 0
             fi
             printf "%b\n" "${GREEN}Launching ${install_path} (attached if possible)${NC}" >"$out"
+            # Try to run attached to /dev/tty in a subshell so we don't replace the installer process.
             if [[ -w /dev/tty ]]; then
                 ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty ) &
             else
@@ -282,10 +275,17 @@ install_action() {
     try_open_tty || true
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
-    # For dry mode we DO NOT remove the installed file; countdown_and_apply_mode will run --dry-run.
+
+    # Perform countdown + apply for selected mode.
+    # If user selected "none", we will NOT exit the installer; we return to main menu after displaying status.
     countdown_and_apply_mode "$install_path" "$chosen_mode"
 
-    # After install we will exit the installer (preserve original behavior)
+    if [[ "$chosen_mode" == "none" ]]; then
+        # Return to caller (main menu) so user can choose again, per request.
+        return 0
+    fi
+
+    # For other modes (launch/dry) preserve previous behavior and exit installer after completing.
     exec 3<&- 2>/dev/null || true
     exit 0
 }
@@ -361,9 +361,8 @@ while true; do
     case "$selection" in
         1)
             install_action
-            # unreachable because install_action exits, but keep for clarity
-            exec 3<&- 2>/dev/null || true
-            exit 0
+            # If install_action returns (chosen_mode == none), loop will continue; otherwise install_action exits.
+            continue
             ;;
         2)
             uninstall_action
