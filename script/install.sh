@@ -60,12 +60,12 @@ chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 log_info "Configuring firewall rules..."
 
 # Detect firewall type and act accordingly.
-# Possible values: firewalld, csf, nftables, iptables, none
+# Prefer csf (cPanel/ConfigServer) if present, otherwise detect firewalld, nftables, iptables, none
 firewall_type="none"
-if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall_type="firewalld"
-elif command -v csf >/dev/null 2>&1 || [[ -f /etc/csf/csf.conf ]]; then
+if command -v csf >/dev/null 2>&1 || [[ -f /etc/csf/csf.conf ]]; then
     firewall_type="csf"
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall_type="firewalld"
 elif command -v nft >/dev/null 2>&1; then
     firewall_type="nftables"
 elif command -v iptables >/dev/null 2>&1; then
@@ -76,7 +76,7 @@ fi
 
 # Handle firewalld specially: attempt to fetch and use the repo helper; otherwise fallback to firewall-cmd directly.
 if [[ "$firewall_type" == "firewalld" ]]; then
-    log_info "Detected firewall: firewalld (will attempt to use script/firewalld-support.sh helper)"
+    log_info "Detected firewall: firewalld"
 
     HELPER_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/firewalld-support.sh"
     TMP_HELPER="/tmp/linkzero-firewalld-helper-$$.sh"
@@ -94,16 +94,16 @@ if [[ "$firewall_type" == "firewalld" ]]; then
     fi
 
     if $fetched_helper && [[ -s "$TMP_HELPER" ]]; then
-        # Ensure executable
+        # Ensure executable (harmless if noexec is set; we will run via bash to avoid noexec issues)
         chmod +x "$TMP_HELPER" || true
 
-        # Run helper commands via the temporary helper file. Guard each call so failures won't abort install.
-        "$TMP_HELPER" enable || true
-        "$TMP_HELPER" add-interface "${WAN_IF:-eth0}" public || true
-        "$TMP_HELPER" add-masquerade public || true
+        # Run helper commands via the temporary helper file using an explicit shell so /tmp noexec won't block execution.
+        bash "$TMP_HELPER" enable || true
+        bash "$TMP_HELPER" add-interface "${WAN_IF:-eth0}" public || true
+        bash "$TMP_HELPER" add-masquerade public || true
         # If cPanel/CSF is present, the helper will delegate add-port/remove-port to CSF. Still call add-port for LinkZero ports.
-        "$TMP_HELPER" add-port "${WG_PORT:-51820}" udp public || true
-        "$TMP_HELPER" add-port "${API_PORT:-8080}" tcp public || true
+        bash "$TMP_HELPER" add-port "${WG_PORT:-51820}" udp public || true
+        bash "$TMP_HELPER" add-port "${API_PORT:-8080}" tcp public || true
 
         # Clean up the temporary helper
         rm -f "$TMP_HELPER" || true
