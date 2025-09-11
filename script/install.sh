@@ -4,12 +4,9 @@
 # and a short pre-autostart menu that appears right after installation
 # (between the "[INFO] Installed to ..." line and the orange "Warning: ..." line).
 #
-# NOTES:
-# - The main menu only contains: Install / Uninstall / Exit (no "Configure Autostart Mode").
-# - A separate, ephemeral pre-autostart menu appears immediately after install and
-#   BEFORE the orange warning/countdown. It is independent from the main menu.
-# - Dry-run removes the just-installed file (to simulate no-change) and still shows
-#   the 5-second delay. The countdown prints one line per second to avoid display issues.
+# The pre-autostart menu is separate from the main install/uninstall menu and only
+# runs just before the installed program would be auto-started. It lets the user
+# choose per-run behavior: launch (foreground), background, none, or dry-run.
 #
 set -euo pipefail
 
@@ -39,7 +36,7 @@ echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
 echo -e "${BLUE}========================================================"
 echo -e "        QHTL Zero Configurator SMTP Hardening    "
 echo -e "========================================================${NC}"
-echo ""
+echo -e ""
 
 # Config
 SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable_smtp_plain.sh"
