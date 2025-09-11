@@ -16,10 +16,10 @@ Disable unencrypted communication on port 25 and enforce secure SMTP connections
 
 ```bash
 # One-line installer (recommended)
-curl -sSL https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/danpolltd/LinkZero/main/script/install.sh | sudo bash
 
 # Alternative with wget
-wget -O - https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/script/install.sh | sudo bash
+wget -O - https://raw.githubusercontent.com/danpolltd/LinkZero/main/script/install.sh | sudo bash
 ```
 
 ## Usage
