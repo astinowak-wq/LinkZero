@@ -18,10 +18,12 @@ WG_PORT="${WG_PORT:-51820}"
 API_PORT="${API_PORT:-8080}"
 WAN_IF="${WAN_IF:-eth0}"
 
-# Colors
+# Colors / text styles
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 log_info() {
