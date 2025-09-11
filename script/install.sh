@@ -283,24 +283,8 @@ uninstall_action() {
         return 0
     fi
 
-    if [[ "$YES" != true ]]; then
-        try_open_tty || true
-        open_io
-        if [[ -z "$INPUT_FD" ]]; then
-            warn "No interactive input — cancelling uninstall."
-            return 0
-        fi
-        read_line resp "Confirm removal? (Enter to remove, any other key to cancel): "
-        # Treat empty line as confirmation (Enter)
-        if [[ -z "$resp" ]]; then
-            rm -f "$install_path" && log "Removed $install_path"
-        else
-            warn "Uninstall cancelled."
-            return 0
-        fi
-    else
-        rm -f "$install_path" && log "Removed $install_path"
-    fi
+    # No interactive confirmation — always remove when uninstall_action is called.
+    rm -f "$install_path" && log "Removed $install_path"
 }
 
 # If explicit action requested, do it and exit
