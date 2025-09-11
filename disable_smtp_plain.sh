@@ -14,8 +14,15 @@
 #
 # Other behavior: backups are non-interactive and use .link0; commands logged
 # to LOG_FILE only. Edits/restarts remain interactive.
-#
 set -euo pipefail
+
+# Ensure terminal state restored on exit
+on_exit() {
+  # restore terminal settings in case the script hid the cursor or changed stty
+  tput cnorm 2>/dev/null || true
+  stty sane 2>/dev/null || true
+}
+trap on_exit EXIT
 
 # Colors (fallback) - ensure defined before any logging when set -u is used
 RED='\033[0;31m'
@@ -198,7 +205,7 @@ detect_active_firewall() {
 }
 
 # simple extraction check for firewall changes (kept compact)
-firewall_change_exists() {
+firebase_change_exists() {
   local manager="$1"; shift
   local cmd="$*"
   local ports; ports="$(echo "$cmd" | grep -oE '([0-9]{2,5})' | tr '\n' ' ' | tr ' ' '\n' | sort -u || true)"
@@ -211,8 +218,8 @@ firewall_change_exists() {
       csf)
         if [[ -r /etc/csf/csf.conf ]]; then
           local line; line="$(grep -i '^TCP_IN' /etc/csf/csf.conf 2>/dev/null | head -n1 || true)"
-          line="${line#*=}"; line="${line//\"/}"; line="${line//\'/}"; line="${line// /}"
-          for p in 25 465 587; do grep -q "^$p\$" <<<"${line//,/\\n}" && return 0 || true; done
+          line="${line#*=}"; line="${line//"/}"; line="${line//'/'}"; line="${line// /}"
+          for p in 25 465 587; do grep -q "^$p$" <<<"${line//,/\n}" && return 0 || true; done
         fi ;;
     esac
   done
@@ -373,7 +380,7 @@ configure_exim(){
       perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; find '$exim_conf' -type f -name '*.conf' -exec sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/ d' {} + || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
-      local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
+      local sed_cmd="sed -i.link0 -E 's/^\s*AUTH_CLIENT_ALLOW_NOTLS\b.*//I' '$exim_conf' || true"
       perform_backup "Backup Exim config file" "$backup_cmd"
       perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim config" "$sed_cmd"
     fi
@@ -396,12 +403,12 @@ _print_summary(){
   local i
   for i in "${!ACTION_DESCS[@]}"; do
     local d="${ACTION_DESCS[$i]}"; local r="${ACTION_RESULTS[$i]}"
-    case "$r" in
-      executed) printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "$GREEN" "$RESET" "$d" ;;
-      failed) printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "$RED" "$RESET" "$d" ;;
-      skipped) printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "$MAGENTA" "$RESET" "$d" ;;
-      dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "$YELLOW" "$RESET" "$d" ;;
-      already) printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "$BLUE" "$RESET" "$d" ;;
+    case "${r}" in
+      executed) printf "%s %b[EXECUTED]%b — %s\n" "$((i+1))." "${GREEN}" "$RESET" "$d" ;;
+      failed) printf "%s %b[FAILED]%b   — %s\n" "$((i+1))." "${RED}" "$RESET" "$d" ;;
+      skipped) printf "%s %b[REJECTED]%b — %s\n" "$((i+1))." "${MAGENTA}" "$RESET" "$d" ;;
+      dry-accepted) printf "%s %b[DRY-RUN]%b  — %s\n" "$((i+1))." "${YELLOW}" "$RESET" "$d" ;;
+      already) printf "%s %b[MATCH]%b    — %s\n" "$((i+1))." "${BLUE}" "$RESET" "$d" ;;
       *) printf "%s [UNKNOWN] — %s\n" "$((i+1))." "$d" ;;
     esac
   done
@@ -485,6 +492,9 @@ echo -e ""
 
   log_info "Completed smtp-hardening run"
   _print_summary
+
+  # ensure we exit cleanly (trap will restore terminal state)
+  exit 0
 }
 
 main "$@"
