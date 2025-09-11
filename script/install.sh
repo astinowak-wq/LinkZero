@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# LinkZero Installation Script (fixed conditional errors)
+# LinkZero Installation Script (fixed: exit after menu selection)
 # Robust interactive menu when piped into sudo bash.
 #
 set -euo pipefail
@@ -281,7 +281,7 @@ if [[ "$SHOW_MENU" == true ]]; then
             $'\n'|$'\r')
                 tput cnorm 2>/dev/null || true
                 case $sel in
-                    0) install_action; break ;;
+                    0) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
                     1) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
                     2) echo "Exiting."; exec 3<&- 2>/dev/null || true; exit 0 ;;
                 esac
