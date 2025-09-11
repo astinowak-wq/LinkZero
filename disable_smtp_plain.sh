@@ -393,9 +393,9 @@ echo -e "   █████  █   █  █████        █      █     
 echo -e "  █     █ █   █    █          █               █  █"
 echo -e "  █     █ █   █    █          █      █  █     █ █ "
 echo -e "  █     █ █████    █          █      █  ████  ██  "
-echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
+echo -e "  █   █ █ █   █    █          █      █  █   █ █ █ "
 echo -e "   █████  █   █    █          █████  █  █   █ █  █"
-echo -e "${NC}"
+echo -e "        █${NC}"
 
 # Red bold capital Daniel Nowakowski below logo
 echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
