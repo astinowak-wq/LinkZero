@@ -10,8 +10,9 @@
 # Author:
 #   Danpol Community and Daniel Nowakowski
 #
-# Note: When run interactively, the script prints a red author banner near the
-# start of execution so the author is visible immediately.
+# Note: When run interactively, the script clears the console and prints a red
+# author banner near the start of execution so the author is visible immediately.
+# The banner is followed by two empty lines for visibility.
 #
 # Usage:
 #   sudo ./disable_smtp_plain.sh [--dry-run] [--backup-only] [--restore] [--rollback]
@@ -475,16 +476,25 @@ main(){
     check_cloudlinux
     create_backup_dir
 
-    # Print the author banner (red when interactive)
+    # Clear the console for interactive terminals so banner is prominent
     if [[ -t 1 ]]; then
-        # Print a clear, colored author banner for interactive terminals
-        printf "%b%s%b\n" "$RED" "$AUTHOR_TEXT" "$NC"
+        clear
+    fi
+
+    # Print the author banner (red when interactive) with two blank lines after
+    if [[ -t 1 ]]; then
+        # Print a clear, colored author banner for interactive terminals and add two extra blank lines
+        printf "%b%s%b\n\n\n" "$RED" "$AUTHOR_TEXT" "$NC"
     else
-        # Non-interactive: log the author as plain text to stdout/log
+        # Non-interactive: plain author line (no extra blank lines)
         printf "%s\n" "$AUTHOR_TEXT"
     fi
-    # Also write author info to logfile for auditing
-    log_info "Author: ${AUTHOR_TEXT}"
+
+    # Also write author info to logfile for auditing WITHOUT printing it to stdout
+    {
+        ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        printf '%s [%s] %s\n' "$ts" "INFO" "Author: ${AUTHOR_TEXT}"
+    } >> "$LOG_FILE" 2>/dev/null || true
 
     backup_configs
 
