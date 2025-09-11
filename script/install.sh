@@ -1,8 +1,6 @@
 #!/bin/bash
 #
-# LinkZero Installation Script (blocking menu input fix)
-# Reads interactive input from /dev/tty on fd 3 and blocks until a key is pressed,
-# preventing the menu from continuously redrawing when there's no user input.
+# LinkZero Installation Script - robust menu fallback on no terminal input
 #
 set -euo pipefail
 
@@ -55,25 +53,25 @@ if [[ -n "$DEBUG" ]]; then
 fi
 
 # read single key (escape sequences).
-# First read blocks until at least one byte is available (no timeout).
-# If the first byte is ESC, read up to 2 more bytes with a tiny timeout
-# so arrow sequences are captured without blocking indefinitely.
+# Blocking read for first byte; if first is ESC, read remainder with small timeout.
 read_key() {
     key=''
     if [[ "$USE_TTY_FD" == true ]]; then
-        # blocking read from fd 3 (user's terminal)
         IFS= read -rsn1 key <&3 2>/dev/null || key=''
         if [[ $key == $'\x1b' ]]; then
-            # try to read the remainder of escape seq but don't block forever
             IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || rest=''
             key+="$rest"
         fi
     else
-        # blocking read from stdin (fallback)
-        IFS= read -rsn1 key 2>/dev/null || key=''
-        if [[ $key == $'\x1b' ]]; then
-            IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=''
-            key+="$rest"
+        # Only read from stdin when stdin is a TTY (not a pipe/script)
+        if [[ -t 0 ]]; then
+            IFS= read -rsn1 key 2>/dev/null || key=''
+            if [[ $key == $'\x1b' ]]; then
+                IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=''
+                key+="$rest"
+            fi
+        else
+            key=''
         fi
     fi
 }
@@ -185,8 +183,14 @@ uninstall_action() {
                         printf "  %s" "${opts[$i]}"
                     fi
                 done
-                # blocking read for user keypress
                 read_key
+                # If read_key returned empty, treat as cancel (no user input)
+                if [[ -z "$key" ]]; then
+                    printf "\n"
+                    log_warn "No input available; cancelling uninstall."
+                    tput cnorm 2>/dev/null || true
+                    return 0
+                fi
                 case "$key" in
                     $'\n'|$'\r') printf "\n"; break ;;
                     $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
@@ -230,6 +234,12 @@ uninstall_action() {
                         fi
                     done
                     read_key
+                    if [[ -z "$key" ]]; then
+                        printf "\n"
+                        log_warn "No input available; keeping log file."
+                        tput cnorm 2>/dev/null || true
+                        break
+                    fi
                     case "$key" in
                         $'\n'|$'\r') printf "\n"; break ;;
                         $'\x1b[C'|$'\x1b[B') opt_sel=$(( (opt_sel+1) % ${#opts[@]} )) ;;
@@ -262,19 +272,17 @@ if [[ -n "$ACTION" ]]; then
     exit 0
 fi
 
-# Decide whether to show interactive menu in a safe, explicit way (no stray -z)
+# Decide whether to show interactive menu in a safe way
 SHOW_MENU=false
-if [[ -t 1 ]] || [[ "$USE_TTY_FD" == true ]]; then
-    if [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; then
-        SHOW_MENU=true
-    fi
+if { [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] && [[ -t 1 ]] ); } && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]]; then
+    SHOW_MENU=true
 fi
 
 if [[ "$SHOW_MENU" == true ]]; then
     options=("Install LinkZero" "Uninstall LinkZero" "Exit")
     sel=0
     tput civis 2>/dev/null || true
-    echo "Use the arrow keys to choose and press Enter to confirm."
+    echo "Use the arrow keys and Enter to choose. Menu will wait for input."
     while true; do
         printf "\n"
         for i in "${!options[@]}"; do
@@ -284,20 +292,32 @@ if [[ "$SHOW_MENU" == true ]]; then
                 printf "   %s\n" "${options[$i]}"
             fi
         done
-        # BLOCKING: wait for user keypress (prevents continuous redraw)
+
+        # blocking read for input
         read_key
+
+        # If no key was read, that means terminal input isn't actually available.
+        # Bail out of interactive mode and fall back to non-interactive install.
+        if [[ -z "$key" ]]; then
+            printf "\n"
+            log_warn "No interactive input detected; falling back to non-interactive install."
+            tput cnorm 2>/dev/null || true
+            exec 3<&- 2>/dev/null || true
+            install_action
+            exit 0
+        fi
+
         case "$key" in
             $'\n'|$'\r')
                 tput cnorm 2>/dev/null || true
                 case $sel in
-                    0) install_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
-                    1) uninstall_action; exec 3<&- 2>/dev/null || true; exit 0 ;;
+                    0) exec 3<&- 2>/dev/null || true; install_action; exit 0 ;;
+                    1) exec 3<&- 2>/dev/null || true; uninstall_action; exit 0 ;;
                     2) echo "Exiting."; exec 3<&- 2>/dev/null || true; exit 0 ;;
                 esac
                 ;;
             $'\x1b[A'|$'\x1b[D')
                 sel=$(( (sel-1 + ${#options[@]}) % ${#options[@]} ))
-                # move cursor up to overwrite menu
                 tput cuu $(( ${#options[@]} + 1 )) 2>/dev/null || printf '\033[%dA' $(( ${#options[@]} + 1 ))
                 ;;
             $'\x1b[B'|$'\x1b[C')
@@ -307,8 +327,8 @@ if [[ "$SHOW_MENU" == true ]]; then
             *) ;;
         esac
     done
-    tput cnorm 2>/dev/null || true
 else
+    # No usable terminal input — run non-interactive install by default
     install_action
 fi
 
