@@ -402,7 +402,7 @@ echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
 
 # Display QHTL Zero header
 echo -e "${BLUE}========================================================"
-echo -e "        QHTL Zero Configurator Roundcube on Cpanel"
+echo -e "        QHTL Zero Configurator SMTP Hardening"
 echo -e "========================================================${NC}"
 echo -e ""
 
