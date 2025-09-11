@@ -2,9 +2,14 @@
 #
 # LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# Update: when the program is already installed, the main menu gains a
-# "Run LinkZero" option so the user can run the preinstalled program
-# directly from the installer. Running returns to the menu afterwards.
+# Fixes for "exits after header" problem:
+# - Do NOT auto-run install when interactive menu is unavailable. Instead,
+#   instruct the user how to run non-interactively. This prevents surprising
+#   immediate installs when stdout/stderr are not ttys.
+# - Make the interactive-menu detection more permissive: if either stdin OR
+#   stdout is a tty, show the menu. (Previously both were required.)
+# - Add a small debug line (printed when DEBUG is set) so you can see why
+#   the script decided not to show the menu.
 #
 set -euo pipefail
 
@@ -55,7 +60,7 @@ err()    { echo -e "${RED}[ERR]${NC} $*"; }
 # Try to open a terminal on fd 3. Order:
 # 1) /dev/tty
 # 2) SUDO_TTY (if set)
-# 3) don't open anything (we will only use stdin if it's a real tty)
+# 3) leave USE_TTY_FD=false
 USE_TTY_FD=false
 try_open_tty() {
     # close previous fd3 if any
@@ -83,7 +88,7 @@ try_open_tty() {
     return 1
 }
 
-# Determine input/output paths to use for line-based prompts.
+# Determine input/output paths to use for prompts.
 INPUT_FD=""
 OUTPUT_PATH=""
 open_io() {
@@ -91,9 +96,7 @@ open_io() {
     OUTPUT_PATH="/dev/stdout"
 
     if [[ "$USE_TTY_FD" == true ]]; then
-        # fd3 is open for read
         INPUT_FD="/dev/fd/3"
-        # prefer /dev/tty for output so prompts are visible even if stdout is redirected
         if [[ -w /dev/tty ]]; then
             OUTPUT_PATH="/dev/tty"
         else
@@ -103,7 +106,7 @@ open_io() {
         INPUT_FD="/dev/tty"
         OUTPUT_PATH="/dev/tty"
     elif [[ -t 0 ]]; then
-        # fallback to stdin/stdout if it's a real tty
+        # fallback to stdin/stdout if stdin is a tty
         INPUT_FD="/dev/stdin"
         OUTPUT_PATH="/dev/stdout"
     else
@@ -113,7 +116,6 @@ open_io() {
 }
 
 # Read a line from chosen input fd into variable named by first arg.
-# Usage: read_line varname "prompt text"
 read_line() {
     local __var="$1"; shift
     local prompt="$*"
@@ -126,6 +128,32 @@ read_line() {
         line=""
     fi
     printf -v "$__var" "%s" "$line"
+}
+
+# parse args
+for arg in "$@"; do
+    case "$arg" in
+        --install|-i) ACTION="install" ;;
+        --uninstall|-u) ACTION="uninstall" ;;
+        --yes|-y) YES=true ;;
+        --force|-f) FORCE=true ;;
+        --interactive) FORCE_MENU=true ;;
+        -h|--help) printf "Usage: %s [--install|--uninstall] [--yes] [--interactive]\n" "$0"; exit 0 ;;
+        *) ;;
+    esac
+done
+
+# DEBUG info helper
+debug_dump() {
+    if [[ -n "$DEBUG" ]]; then
+        printf "DEBUG: -t0=%s -t1=%s SUDO_TTY=%s USE_TTY_FD=%s NONINTERACTIVE=%s CI=%s\n" \
+            "$( [[ -t 0 ]] && echo true || echo false )" \
+            "$( [[ -t 1 ]] && echo true || echo false )" \
+            "${SUDO_TTY:-}" \
+            "$USE_TTY_FD" \
+            "${NONINTERACTIVE:-}" \
+            "${CI:-}"
+    fi
 }
 
 is_installed() {
@@ -152,7 +180,6 @@ choose_prelaunch_mode() {
     open_io
 
     if [[ -z "$INPUT_FD" ]]; then
-        # no interactive input — default to launch
         printf "launch"
         return 0
     fi
@@ -191,10 +218,8 @@ countdown_and_apply_mode() {
             fi
             printf "%b\n" "${GREEN}Running dry-run: ${install_path} --dry-run${NC}" >"$out"
             if [[ -w /dev/tty ]]; then
-                # run attached to tty and wait (subshell so installer is not replaced)
                 ( "$install_path" --dry-run </dev/tty >/dev/tty 2>/dev/tty )
             else
-                # no tty; run detached so installer can continue/exit cleanly
                 nohup "$install_path" --dry-run >/dev/null 2>&1 &
                 printf "%b\n" "${GREEN}Dry-run started in background (nohup).${NC}" >"$out"
             fi
@@ -268,11 +293,9 @@ run_installed_action() {
 
     printf "%b\n" "${GREEN}Running installed program: ${install_path}${NC}" >"$out"
     if [[ -w /dev/tty ]]; then
-        # run attached to tty and wait; subshell so installer is not replaced
         ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty )
         printf "%b\n" "${GREEN}Program exited; returning to installer menu.${NC}" >"$out"
     else
-        # no tty; run detached and return immediately
         nohup "$install_path" >/dev/null 2>&1 &
         printf "%b\n" "${GREEN}Program started in background (nohup).${NC}" >"$out"
     fi
@@ -291,7 +314,7 @@ uninstall_action() {
     return 0
 }
 
-# If explicit action requested, do it and exit
+# If explicit action requested, do it and exit immediately (keeps previous behavior).
 if [[ -n "$ACTION" ]]; then
     try_open_tty || true
     debug_dump
@@ -308,15 +331,17 @@ debug_dump
 CAN_MENU=false
 if [[ "$FORCE_MENU" == true ]]; then
     CAN_MENU=true
-elif [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] && [[ -t 1 ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ -z "${CI:-}" ]] ); then
+elif [[ "$USE_TTY_FD" == true ]] || ( [[ -t 0 ]] || [[ -t 1 ]] ); then
+    # more permissive: show menu if either stdin or stdout is a tty
     CAN_MENU=true
 fi
 
+# If we can't show the menu, do NOT auto-install. Instead instruct the user.
 if [[ "$CAN_MENU" != true ]]; then
-    warn "Interactive menu not available — running non-interactive install."
-    install_action
+    warn "Interactive menu not available."
+    printf "%s\n" "Run with --install to install non-interactively, or run this script from a terminal to use the interactive menu." >&2
     exec 3<&- 2>/dev/null || true
-    exit 0
+    exit 1
 fi
 
 # Numeric-style interactive main menu loop (dynamic options when installed)
@@ -342,7 +367,6 @@ while true; do
     # choose default: prefer "run" if installed, otherwise "install"
     default_choice_index=1
     if is_installed; then
-        # find index of "run" (1-based)
         for idx in "${!MENU_ACTION[@]}"; do
             if [[ "${MENU_ACTION[$idx]}" == "run" ]]; then
                 default_choice_index=$((idx+1))
@@ -391,12 +415,10 @@ while true; do
             ;;
         run)
             run_installed_action
-            # after run, return to menu
             continue
             ;;
         uninstall)
             uninstall_action
-            # after uninstall, return to menu
             continue
             ;;
         exit)
