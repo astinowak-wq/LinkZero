@@ -4,9 +4,12 @@
 # and a short pre-autostart menu that appears right after installation
 # (between the "[INFO] Installed to ..." line and the orange "Warning: ..." line).
 #
-# The pre-autostart menu is separate from the main install/uninstall menu and only
-# runs just before the installed program would be auto-started. It lets the user
-# choose per-run behavior: launch (foreground), background, none, or dry-run.
+# NOTES:
+# - The main menu only contains: Install / Uninstall / Exit (no "Configure Autostart Mode").
+# - A separate, ephemeral pre-autostart menu appears immediately after install and
+#   BEFORE the orange warning/countdown. It is independent from the main menu.
+# - Dry-run removes the just-installed file (to simulate no-change) and still shows
+#   the 5-second delay. The countdown prints one line per second to avoid display issues.
 #
 set -euo pipefail
 
@@ -166,7 +169,7 @@ choose_prelaunch_mode() {
         out="/dev/tty"
         in_fd="/dev/tty"
     elif [[ "$USE_TTY_FD" == true ]]; then
-        # fd3 is available for reading; output to /dev/stdout so messages remain visible
+        # fd3 is available for reading; output to stdout so messages remain visible
         out="/dev/stdout"
         in_fd="/dev/fd/3"
     fi
@@ -184,7 +187,6 @@ choose_prelaunch_mode() {
     local choice=""
     # read choice using /dev/tty or fd3
     if [[ -r "$in_fd" ]]; then
-        # use read with -r so it works with fd path
         read -r -p "Choose [1-4]: " choice <"$in_fd" 2>/dev/null || choice=""
     else
         read -r -p "Choose [1-4]: " choice 2>/dev/null || choice=""
@@ -205,6 +207,7 @@ choose_prelaunch_mode() {
 }
 
 # Countdown + optional launch — prints the requested orange warning and a 5s countdown.
+# Use newline-per-second countdown (more robust across terminals and remote sessions).
 countdown_and_apply_mode() {
     local install_path="$1"
     local mode="$2"
@@ -214,14 +217,14 @@ countdown_and_apply_mode() {
         out="/dev/stdout"
     fi
 
-    # Print the orange warning line (user asked it to be visible between the two lines)
+    # Print the orange warning line
     printf "%b\n" "${ORANGE}Warning: the installed program will be started automatically in ${seconds} seconds.${NC}" >"$out"
 
+    # Print a simple, reliable newline-based countdown to avoid single-line overwrite issues.
     for ((i=seconds;i>=1;i--)); do
-        printf "\r%bStarting in %d... %b" "$ORANGE" "$i" "$NC" >"$out"
+        printf "%b\n" "${ORANGE}Starting in ${i}...${NC}" >"$out"
         sleep 1
     done
-    printf "\n" >"$out"
 
     case "$mode" in
         dry)
@@ -282,8 +285,7 @@ install_action() {
 
     # === NEW: show the pre-autostart menu here, AFTER the "[INFO] Installed to ..." line ===
     # This menu is intentionally independent from the main (install/uninstall) menu.
-    # It only controls immediate post-install behavior and does not affect main menu state.
-    try_open_tty || true     # ensure fd3 is available if possible
+    try_open_tty || true
     local chosen_mode
     chosen_mode="$(choose_prelaunch_mode)" || chosen_mode="launch"
 
