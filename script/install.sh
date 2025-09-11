@@ -1,25 +1,14 @@
 #!/bin/bash
 #
-# LinkZero installer — interactive menu with improved tty detection
-#
-# Test: run 'sudo bash script/install.sh' (or download and run) to see Uninstall preselected when
-#       the script is already installed at /usr/local/bin/linkzero-smtp.
+# LinkZero installer — interactive menu with robust tty/input handling
 #
 set -euo pipefail
 
-# -- Early header: show logo/author even when falling back to non-interactive mode --
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
-# Clear the screen and print the header when stdout is a terminal.
-if [[ -t 1 ]]; then
-    clear
-fi
-
+# Print header early so logo/author show even if we later fall back
+if [[ -t 1 ]]; then clear; fi
 echo -e "${GREEN}"
 echo -e "   █████  █   █  █████        █      █        █   "
 echo -e "  █     █ █   █    █          █               █  █"
@@ -39,60 +28,48 @@ SCRIPT_URL="https://raw.githubusercontent.com/astinowak-wq/LinkZero/main/disable
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="linkzero-smtp"
 
-# State flags
-ACTION=""
-YES=false
-FORCE=false
-FORCE_MENU=false
+ACTION=""; YES=false; FORCE=false; FORCE_MENU=false
 DEBUG="${DEBUG:-}"
 
-log()    { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()   { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()    { echo -e "${RED}[ERR]${NC} $*"; }
+log(){ echo -e "${GREEN}[INFO]${NC} $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
+err(){ echo -e "${RED}[ERR]${NC} $*"; }
 
-# Try to open a terminal on fd 3. Order:
-# 1) /dev/tty
-# 2) SUDO_TTY (if set)
-# 3) nothing (we'll fallback to other reads)
-# We keep fd 3 open when possible and use `read -u 3` which is more reliable than redirection.
+# Try to open a terminal fd (3). Prefer /dev/tty then SUDO_TTY.
 USE_TTY_FD=false
-try_open_tty() {
-    # close previous fd3 if any
+try_open_tty(){
     exec 3<&- 2>/dev/null || true
-
     if [[ -r /dev/tty ]]; then
-        if exec 3</dev/tty 2>/dev/null; then
-            USE_TTY_FD=true
-            return 0
-        else
-            exec 3<&- 2>/dev/null || true
-        fi
+        if exec 3</dev/tty 2>/dev/null; then USE_TTY_FD=true; return 0; fi
     fi
-
     if [[ -n "${SUDO_TTY:-}" && -r "${SUDO_TTY}" ]]; then
-        if exec 3<"${SUDO_TTY}" 2>/dev/null; then
-            USE_TTY_FD=true
-            return 0
-        else
-            exec 3<&- 2>/dev/null || true
-        fi
+        if exec 3<"${SUDO_TTY}" 2>/dev/null; then USE_TTY_FD=true; return 0; fi
     fi
-
     USE_TTY_FD=false
     return 1
 }
 
-# read a single key (blocking). Prefer fd3 when available.
-# sets global 'key' to the captured character(s) or empty if no input device was available.
-read_key() {
-    key=''
-
-    # 1) If we have fd3 open (pointing at /dev/tty or SUDO_TTY), read from it (blocking).
+# Drain any pending bytes on the chosen input fd so stale input doesn't consume the user's press.
+drain_pending_input(){
     if [[ "$USE_TTY_FD" == true ]]; then
-        # read one byte (blocking), then attempt to read up to 2 more bytes for escape sequences with a short timeout
+        while IFS= read -rsn1 -t 0.01 -u 3 _ 2>/dev/null; do :; done
+    elif [[ -t 0 ]]; then
+        while IFS= read -rsn1 -t 0.01 _ 2>/dev/null; do :; done
+    elif [[ -r /dev/tty ]]; then
+        exec 4</dev/tty 2>/dev/null || true
+        while IFS= read -rsn1 -t 0.01 -u 4 _ 2>/dev/null; do :; done
+        exec 4<&- 2>/dev/null || true
+    fi
+}
+
+# read a single key (blocking). Prefer fd3 when available.
+# sets global 'key' to captured data; returns 0 on success, non-zero if no input device.
+read_key(){
+    key=''
+    # prefer fd3 if available
+    if [[ "$USE_TTY_FD" == true ]]; then
         if read -rsn1 -u 3 key 2>/dev/null; then
             if [[ $key == $'\x1b' ]]; then
-                # read remaining two bytes of escape (non-blocking short timeout)
                 IFS= read -rsn2 -t 0.05 -u 3 rest 2>/dev/null || rest=''
                 key+="$rest"
             fi
@@ -100,7 +77,7 @@ read_key() {
         fi
     fi
 
-    # 2) If stdin is a tty, read directly from stdin (blocking)
+    # fallback to stdin if it's a tty
     if [[ -t 0 ]]; then
         if read -rsn1 key 2>/dev/null; then
             if [[ $key == $'\x1b' ]]; then
@@ -111,8 +88,7 @@ read_key() {
         fi
     fi
 
-    # 3) Last resort: open /dev/tty temporarily on fd4 and read from it (blocking).
-    # This helps in environments where fd3 wasn't left open but /dev/tty is readable.
+    # last resort: temporarily open /dev/tty on fd4
     if [[ -r /dev/tty ]]; then
         exec 4</dev/tty 2>/dev/null || true
         if read -rsn1 -u 4 key 2>/dev/null; then
@@ -126,7 +102,6 @@ read_key() {
         exec 4<&- 2>/dev/null || true
     fi
 
-    # no input device available
     key=''
     return 1
 }
@@ -140,12 +115,10 @@ for arg in "$@"; do
         --force|-f) FORCE=true ;;
         --interactive) FORCE_MENU=true ;;
         -h|--help) printf "Usage: %s [--install|--uninstall] [--yes] [--interactive]\n" "$0"; exit 0 ;;
-        *) ;;
     esac
 done
 
-# DEBUG info helper
-debug_dump() {
+debug_dump(){
     if [[ -n "$DEBUG" ]]; then
         printf "DEBUG: -t0=%s -t1=%s SUDO_TTY=%s USE_TTY_FD=%s NONINTERACTIVE=%s CI=%s\n" \
             "$( [[ -t 0 ]] && echo true || echo false )" \
@@ -157,11 +130,9 @@ debug_dump() {
     fi
 }
 
-ensure_install_dir() {
-    [[ -d "$INSTALL_DIR" ]] || mkdir -p "$INSTALL_DIR"
-}
+ensure_install_dir(){ [[ -d "$INSTALL_DIR" ]] || mkdir -p "$INSTALL_DIR"; }
 
-download_script_to_temp() {
+download_script_to_temp(){
     local url="$1" tmp="$2"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$url" -o "$tmp"
@@ -172,7 +143,7 @@ download_script_to_temp() {
     fi
 }
 
-install_action() {
+install_action(){
     log "Installing LinkZero..."
     ensure_install_dir
     TMP_DL="$(mktemp /tmp/linkzero-XXXXXX.sh)"
@@ -189,56 +160,25 @@ install_action() {
     log "Installed to $install_path"
 }
 
-# Uninstall: remove files that were created by installation.
-# We remove the main installed script and a small set of well-known dirs (if present).
-# The user is prompted unless --yes was provided.
-uninstall_action() {
+uninstall_action(){
     local install_path="$INSTALL_DIR/$SCRIPT_NAME"
     local targets=("$install_path" "/etc/linkzero" "/usr/local/share/linkzero" "/var/lib/linkzero")
-    local any_found=false
-
-    # Collect existing targets
-    local to_remove=()
+    local any_found=false to_remove=()
     for t in "${targets[@]}"; do
-        if [[ -e "$t" ]]; then
-            to_remove+=("$t")
-            any_found=true
-        fi
+        if [[ -e "$t" ]]; then to_remove+=("$t"); any_found=true; fi
     done
-
-    if [[ "$any_found" != true ]]; then
-        warn "Nothing to remove. No known LinkZero files found."
-        return 0
-    fi
-
+    if [[ "$any_found" != true ]]; then warn "Nothing to remove. No known LinkZero files found."; return 0; fi
     echo "The following items will be removed:"
-    for t in "${to_remove[@]}"; do
-        echo "  $t"
-    done
-
+    for t in "${to_remove[@]}"; do echo "  $t"; done
     if [[ "$YES" != true ]]; then
-        echo ""
-        echo -n "Confirm removal (y/N): "
-        # read a single key for yes/no
-        if ! read_key; then
-            warn "No interactive input — cancelling uninstall."
-            return 1
-        fi
-        case "$key" in
-            [yY]) ;; # proceed
-            *) warn "Uninstall cancelled."; return 0 ;;
-        esac
+        echo ""; echo -n "Confirm removal (y/N): "
+        if ! read_key; then warn "No interactive input — cancelling uninstall."; return 1; fi
+        case "$key" in [yY]) ;; *) warn "Uninstall cancelled."; return 0 ;; esac
     fi
-
-    # Perform removal (be conservative and report results)
     for t in "${to_remove[@]}"; do
-        if [[ -d "$t" ]]; then
-            rm -rf -- "$t" && log "Removed directory $t" || warn "Failed to remove $t"
-        else
-            rm -f -- "$t" && log "Removed file $t" || warn "Failed to remove $t"
-        fi
+        if [[ -d "$t" ]]; then rm -rf -- "$t" && log "Removed directory $t" || warn "Failed to remove $t"
+        else rm -f -- "$t" && log "Removed file $t" || warn "Failed to remove $t"; fi
     done
-
     log "Uninstall completed."
 }
 
@@ -270,39 +210,29 @@ if [[ "$CAN_MENU" != true ]]; then
     exit 0
 fi
 
-# show interactive menu (we have some tty fd to read from)
+# Interactive menu
 options=("Install LinkZero" "Uninstall LinkZero" "Exit")
-
-# Preselect Uninstall if the script appears already installed.
-# This improves UX: users who already have LinkZero installed are likely trying to uninstall.
-# Override: use --install or --uninstall flags, or --interactive to force the menu.
 declare -i sel=0
-if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" ]] || [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
-    sel=1
-else
-    sel=0
-fi
+if [[ -x "$INSTALL_DIR/$SCRIPT_NAME" || -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then sel=1; else sel=0; fi
 
 tput civis 2>/dev/null || true
 echo "Use the arrow keys and Enter to choose."
 
-# helper: redraw menu
-redraw_menu() {
+# Ensure we don't have stale input before showing the menu
+drain_pending_input
+
+redraw_menu(){
     printf "\n"
     for i in "${!options[@]}"; do
-        if (( i == sel )); then
-            printf "  \033[7m%s\033[0m\n" "${options[$i]}"
-        else
-            printf "   %s\n" "${options[$i]}"
-        fi
+        if (( i == sel )); then printf "  \033[7m%s\033[0m\n" "${options[$i]}"
+        else printf "   %s\n" "${options[$i]}"; fi
     done
 }
 
-# initial draw
 redraw_menu
 
 while true; do
-    # Read a key (blocking). read_key returns non-zero if no input device was available.
+    # blocking read for a single keypress (robust)
     if ! read_key; then
         warn "No interactive input read; falling back to non-interactive install."
         tput cnorm 2>/dev/null || true
@@ -315,21 +245,9 @@ while true; do
         $'\n'|$'\r')
             tput cnorm 2>/dev/null || true
             case $((sel)) in
-                0)
-                    exec 3<&- 2>/dev/null || true
-                    install_action
-                    exit 0
-                    ;;
-                1)
-                    exec 3<&- 2>/dev/null || true
-                    uninstall_action
-                    exit 0
-                    ;;
-                2)
-                    exec 3<&- 2>/dev/null || true
-                    echo "Exit."
-                    exit 0
-                    ;;
+                0) exec 3<&- 2>/dev/null || true; install_action; exit 0 ;;
+                1) exec 3<&- 2>/dev/null || true; uninstall_action; exit 0 ;;
+                2) exec 3<&- 2>/dev/null || true; echo "Exit."; exit 0 ;;
             esac
             ;;
         $'\x1b[A'|$'\x1b[D') # up/left
@@ -350,6 +268,5 @@ while true; do
     esac
 done
 
-# close fd 3
 exec 3<&- 2>/dev/null || true
 exit 0
