@@ -4,11 +4,11 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# This revision displays a simple two-option chooser (Yes / No). Yes is green,
-# No is red, and the currently highlighted option is shown in bold. Left/right
-# arrows (or h/l) cycle between the options and Enter confirms. In --dry-run
-# the script never performs changes even when Yes is chosen; accepted actions
-# in dry-run are recorded as "dry-accepted".
+# This revision detects the active firewall manager (priority: nftables > csf >
+# firewalld > iptables) and only presents/actions for the detected one.
+# When a higher-priority manager is active, lower-priority managers are muted
+# (not shown and not executed). The interactive chooser remains the two-option
+# arrow-driven Yes/No dialog (Yes = green, No = red, selected option bold).
 #
 set -euo pipefail
 
@@ -41,7 +41,6 @@ declare -a ACTION_DESCS
 declare -a ACTION_CMDS
 declare -a ACTION_RESULTS   # values: executed / skipped / dry-accepted / failed
 
-# Logging helpers (do not write files on dry-run)
 log() {
   local level="$1"; shift
   local msg="$*"
@@ -56,6 +55,58 @@ log() {
 log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
+
+# Detect the active firewall manager. Priority:
+# - nftables (preferred)
+# - csf (ConfigServer)
+# - firewalld
+# - iptables (fallback)
+# - none (if nothing detected)
+detect_active_firewall() {
+  # nftables active? check systemd or presence of ruleset
+  if command -v nft >/dev/null 2>&1; then
+    if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then
+      echo "nftables"
+      return 0
+    fi
+  fi
+
+  # csf present and seems installed? check binary and config dir
+  if command -v csf >/dev/null 2>&1 || [[ -d /etc/csf ]]; then
+    # prefer csf if detected - try a gentle check
+    if command -v csf >/dev/null 2>&1; then
+      echo "csf"
+      return 0
+    fi
+    # fallback: if /etc/csf exists assume csf is the manager
+    if [[ -d /etc/csf ]]; then
+      echo "csf"
+      return 0
+    fi
+  fi
+
+  # firewalld active?
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if firewall-cmd --state >/dev/null 2>&1; then
+      if firewall-cmd --state 2>/dev/null | grep -qi running; then
+        echo "firewalld"
+        return 0
+      fi
+    elif systemctl is-active --quiet firewalld 2>/dev/null; then
+      echo "firewalld"
+      return 0
+    fi
+  fi
+
+  # iptables present as a fallback (only exposed if no other manager found)
+  if command -v iptables-save >/dev/null 2>&1; then
+    echo "iptables"
+    return 0
+  fi
+
+  echo "none"
+  return 0
+}
 
 # Terminal arrow-based chooser:
 # - prompt: displayed text to ask
@@ -76,12 +127,11 @@ choose_yes_no() {
   local sel=0
   local key
 
-  # hide cursor if possible
   tput civis 2>/dev/null || true
 
   while true; do
     # clear line and render prompt with colored options
-    printf '\r\033[K'  # CR + clear to end of line
+    printf '\r\033[K'
 
     if [[ $sel -eq 0 ]]; then
       option_yes="${BOLD}${GREEN}YES${RESET}"
@@ -91,21 +141,17 @@ choose_yes_no() {
       option_no="${BOLD}${RED}NO${RESET}"
     fi
 
-    # Print: cyan bold prompt text then options
     printf "%b %s   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "$option_yes" "$option_no"
 
-    # read one key (raw, silent)
     IFS= read -rsn1 key 2>/dev/null || key=''
 
-    # If it's an escape, read remaining bytes of the sequence (arrow keys)
     if [[ $key == $'\x1b' ]]; then
-      # read up to two more bytes (common CSI sequences are 3 bytes total)
       IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
       key+="$rest"
     fi
 
     case "$key" in
-      $'\n'|$'\r'|'')   # Enter pressed
+      $'\n'|$'\r'|'')
         printf "\n"
         tput cnorm 2>/dev/null || true
         if [[ $sel -eq 0 ]]; then
@@ -114,7 +160,7 @@ choose_yes_no() {
           return 1
         fi
         ;;
-      $'\x1b[C'|$'\x1b[D')  # Right or Left arrow
+      $'\x1b[C'|$'\x1b[D')
         sel=$((1 - sel))
         ;;
       h|H|l|L)
@@ -127,7 +173,6 @@ choose_yes_no() {
         exit 1
         ;;
       *)
-        # ignore other keys
         ;;
     esac
   done
@@ -173,40 +218,53 @@ perform_action(){
   fi
 }
 
-# Compatibility shim
-run_or_echo(){
-  perform_action "Run command" "$*"
-}
+# Configure firewall: only act on the detected active firewall manager.
+configure_firewall() {
+  local fw
+  fw="$(detect_active_firewall)"
+  log_info "Detected firewall manager: ${fw}"
 
-backup_iptables_snapshot(){
-  local BACKUP_DIR="/var/backups/linkzero"
-  local TIMESTAMP
-  TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+  case "$fw" in
+    nftables)
+      log_info "Managing nftables only; csf/firewalld/iptables will be muted."
+      # Create a table/chain if missing and add rules for ports 587/25/465
+      local nft_base="nft add table inet linkzero >/dev/null 2>&1 || true; \
+nft add chain inet linkzero input '{ type filter hook input priority 0 ; }' >/dev/null 2>&1 || true;"
+      perform_action "Ensure nftables table/chain exists (linkzero inet filter)" \
+        "$nft_base"
 
-  if ! command -v iptables-save >/dev/null 2>&1; then
-    log_info "iptables-save not found; skipping snapshot"
-    return 0
-  fi
-
-  perform_action "Create backup directory for iptables snapshot" "mkdir -p '$BACKUP_DIR'"
-  perform_action "Save current iptables rules to snapshot" "iptables-save > '$BACKUP_DIR/iptables.$TIMESTAMP'"
-}
-
-configure_firewall(){
-  log_info "Preparing firewall changes: allow submission on port 587 and enforce TLS-only AUTH"
-  backup_iptables_snapshot
-
-  local cmd1="iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
-  local cmd2="iptables -I INPUT -p tcp --dport 25 -j ACCEPT"
-  local cmd3="iptables -I INPUT -p tcp --dport 465 -j ACCEPT"
-
-  perform_action "Allow Submission (port 587)" "$cmd1"
-  perform_action "Allow SMTP (port 25)" "$cmd2"
-  perform_action "Allow SMTPS (port 465)" "$cmd3"
-
-  if command -v csf >/dev/null 2>&1; then
-    perform_action "Reload CSF (ConfigServer) firewall" "csf -r"
-  fi
+      perform_action "Allow Submission (port 587) in nftables" \
+        "$nft_base nft add rule inet linkzero input tcp dport 587 accept >/dev/null 2>&1 || true"
+      perform_action "Allow SMTP (port 25) in nftables" \
+        "$nft_base nft add rule inet linkzero input tcp dport 25 accept >/dev/null 2>&1 || true"
+      perform_action "Allow SMTPS (port 465) in nftables" \
+        "$nft_base nft add rule inet linkzero input tcp dport 465 accept >/dev/null 2>&1 || true"
+      ;;
+    csf)
+      log_info "Managing CSF only; firewalld/iptables will be muted."
+      # For csf we reload to apply changes, and recommend editing /etc/csf/csf.conf
+      perform_action "Reload CSF (ConfigServer) firewall" "csf -r || true"
+      perform_action "Notify to ensure /etc/csf/csf.conf includes TCP_IN ports 25,587,465" \
+        "printf '%s\n' 'Please edit /etc/csf/csf.conf and ensure TCP_IN includes 25,587,465' >&2"
+      ;;
+    firewalld)
+      log_info "Managing firewalld only; csf/iptables will be muted."
+      perform_action "Open port 587/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=587/tcp"
+      perform_action "Open port 25/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=25/tcp"
+      perform_action "Open port 465/tcp permanently in firewalld" "firewall-cmd --permanent --add-port=465/tcp"
+      perform_action "Reload firewalld to apply permanent changes" "firewall-cmd --reload"
+      ;;
+    iptables)
+      log_info "Managing iptables only (no higher-level manager detected)."
+      perform_action "Allow Submission (port 587)" "iptables -I INPUT -p tcp --dport 587 -j ACCEPT"
+      perform_action "Allow SMTP (port 25)" "iptables -I INPUT -p tcp --dport 25 -j ACCEPT"
+      perform_action "Allow SMTPS (port 465)" "iptables -I INPUT -p tcp --dport 465 -j ACCEPT"
+      ;;
+    none|*)
+      log_info "No recognized firewall manager detected; skipping firewall changes."
+      echo -e "${YELLOW}No active firewall manager detected (nftables, csf, firewalld, iptables).${RESET}"
+      ;;
+  esac
 }
 
 configure_postfix(){
