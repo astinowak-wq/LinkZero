@@ -4,13 +4,11 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Revision notes (this change):
-# - detect_active_mailserver() now also detects a "variant" (currently: cPanel)
-#   and sets MAIL_SERVER_VARIANT. The initial INFO line prints the variant
-#   (e.g. "exim (cPanel)").
-# - Detection logic unchanged for deciding which configure_* to run (priority:
-#   exim -> postfix -> none). Only the displayed INFO line includes the variant.
-# - No command texts are printed to terminal; full commands remain logged to LOG_FILE.
+# Notes:
+# - Backups now always use the ".link0" suffix instead of ".bak".
+# - Backup actions are non-interactive (no accept/reject prompt); they run
+#   automatically (or are recorded in dry-run).
+# - Other actions (edits, restarts, firewall changes) remain interactive.
 #
 set -euo pipefail
 
@@ -97,6 +95,42 @@ log_command_to_file_only() {
   local cmd="$*"
   log_to_file "$level" "$msg: $cmd"
   # intentionally silent on stdout/stderr
+}
+
+# Non-interactive backup action: does not prompt. Respects DRY_RUN.
+# Records planned backup to logfile and executes the backup (or marks dry-run).
+perform_backup() {
+  local desc="$1"; shift
+  local cmd="$*"
+
+  echo -e "${CYAN}${BOLD}Action:${RESET} ${desc}"
+
+  ACTION_DESCS+=("$desc")
+  ACTION_CMDS+=("$cmd")
+
+  # Record the planned backup to logfile only
+  log_command_to_file_only "INFO" "Planned backup for action" "$cmd"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    printf "%b%s%b\n" "${GREEN}" "Backup recorded (dry-run)" "${RESET}"
+    ACTION_RESULTS+=("dry-accepted")
+    log_command_to_file_only "INFO" "DRY-RUN: would run backup" "$cmd"
+    return 0
+  fi
+
+  # Execute backup (no prompt)
+  log_command_to_file_only "INFO" "Executing backup for action" "$cmd"
+  if eval "$cmd"; then
+    printf "%b%s%b\n" "${GREEN}" "Backup completed" "${RESET}"
+    ACTION_RESULTS+=("executed")
+    log_success "$desc"
+    return 0
+  else
+    printf "%b%s%b\n" "${RED}" "Backup failed" "${RESET}"
+    ACTION_RESULTS+=("failed")
+    log_error "$desc failed"
+    return 1
+  fi
 }
 
 # Robust CSF presence check.
@@ -340,7 +374,7 @@ perform_action(){
       return 0
     fi
 
-    # Record execution attempt to logfile only
+    # Record execution attempt to logfile only (no command printed to terminal)
     log_command_to_file_only "INFO" "Executing command for action" "$cmd"
     if eval "$cmd"; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
@@ -568,14 +602,15 @@ configure_exim(){
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
-      # backup the conf.d directory
-      local backup_cmd="tar -czf '${exim_conf}.bak.$timestamp.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
-      perform_action "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.bak -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
+      # backup the conf.d directory (non-interactive)
+      local backup_cmd="tar -czf '${exim_conf}.link0.$timestamp.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
+      perform_backup "Backup Exim split-config directory" "$backup_cmd"
+      # apply edits cautiously: sed will create .link0 backups for files it modifies
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
     else
-      local backup_cmd="cp -a '$exim_conf' '${exim_conf}.bak.$timestamp' || true"
-      local sed_cmd="sed -i.bak -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
-      perform_action "Backup Exim config file" "$backup_cmd"
+      local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.$timestamp' || true"
+      local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
+      perform_backup "Backup Exim config file" "$backup_cmd"
       perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim config" "$sed_cmd"
     fi
   else
