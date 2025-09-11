@@ -288,11 +288,20 @@ capitalize_first() {
 
 configure_postfix(){
   log_info "Configuring Postfix to require TLS for AUTH"
-  if ! command -v postconf >/dev/null 2>&1; then log_info "postconf not present; skipping Postfix configuration"; return 0; fi
+  if ! command -v postconf >/dev/null 2>&1; then
+    log_info "postconf not present; skipping Postfix configuration"
+    return 0
+  fi
+
   perform_action "Set Postfix: smtpd_tls_auth_only = yes" "postconf -e 'smtpd_tls_auth_only = yes'"
   perform_action "Set Postfix: smtpd_tls_security_level = may" "postconf -e 'smtpd_tls_security_level = may'"
   perform_action "Set Postfix: smtpd_sasl_auth_enable = yes" "postconf -e 'smtpd_sasl_auth_enable = yes'"
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart";[...]
+
+  if command -v systemctl >/dev/null 2>&1; then
+    perform_action "Restart Postfix via systemctl" "systemctl restart postfix || true"
+  else
+    perform_action "Restart Postfix via service" "service postfix restart || true"
+  fi
 }
 
 configure_exim(){
@@ -311,13 +320,22 @@ configure_exim(){
   if [[ -z "$exim_conf" && "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
     local candidates=( "/var/cpanel/exim.conf" "/var/cpanel/main_exim.conf" "/var/cpanel/exim.conf.local" "/etc/exim.conf" "/etc/exim.conf.local" "/var/cpanel/userdata/*/exim.conf" )
     for p in "${candidates[@]}"; do
-      for f in $p; do [[ -f "$f" ]] && { exim_conf="$f"; break 2; } done
+      for f in $p; do
+        if [[ -f "$f" ]]; then
+          exim_conf="$f"
+          break 2
+        fi
+      done
     done
     if [[ -z "$exim_conf" ]]; then
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proc[...]
+    if [[ -n "$exim_conf" ]]; then
+      log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"
+    else
+      log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding without config edits"
+    fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
@@ -325,11 +343,22 @@ configure_exim(){
       local ev; ev="$(exim -bV 2>&1 || true)"
       exim_conf="$(printf '%s\n' "$ev" | sed -nE 's/.*Configuration file[^:]*:[[:space:]]*(.+)$/\1/p' | head -n1 || true)"
       if [[ -z "$exim_conf" ]] && printf '%s\n' "$ev" | grep -qi '/etc/exim4'; then
-        if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"; elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
+        if [[ -f /etc/exim4/exim4.conf.template ]]; then
+          exim_conf="/etc/exim4/exim4.conf.template"
+        elif [[ -d /etc/exim4 ]]; then
+          exim_conf="/etc/exim4"
+        fi
       fi
       exim_conf="$(echo "$exim_conf" | xargs || true)"
-      if [[ -n "$exim_conf" && -f "$exim_conf" ]]; then log_info "Discovered Exim configuration via 'exim -bV': ${exim_conf}"; else
-        if [[ -d /etc/exim4/conf.d ]]; then exim_conf="/etc/exim4"; log_info "Detected exim4 split-config directory: ${exim_conf}"; else exim_conf=""; fi
+      if [[ -n "$exim_conf" && -f "$exim_conf" ]]; then
+        log_info "Discovered Exim configuration via 'exim -bV': ${exim_conf}"
+      else
+        if [[ -d /etc/exim4/conf.d ]]; then
+          exim_conf="/etc/exim4"
+          log_info "Detected exim4 split-config directory: ${exim_conf}"
+        else
+          exim_conf=""
+        fi
       fi
     fi
   fi
@@ -339,7 +368,7 @@ configure_exim(){
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_N[...]
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; find '$exim_conf' -type f -name '*.conf' -exec sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/ d' {} + || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
       local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
@@ -350,20 +379,25 @@ configure_exim(){
     log_info "Exim configuration not located; skipping config-file edits"
   fi
 
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Exim via systemctl" "systemctl restart exim4 || systemctl restart exim || true"
-  else perform_action "Restart Exim via service" "service exim4 restart || service exim restart || true"; fi
+  if command -v systemctl >/dev/null 2>&1; then
+    perform_action "Restart Exim via systemctl" "systemctl restart exim4 || systemctl restart exim || true"
+  else
+    perform_action "Restart Exim via service" "service exim4 restart || service exim restart || true"
+  fi
 }
 
 test_configuration(){
-  # "Running basic mail-server checks" informational log removed per request:
+  # Intentionally removed the interactive Exim "basic configuration info" action to avoid the
+  # "Action: Exim: basic configuration info / Apply? [ YES ] [ NO ]" prompt per your request.
+
   if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then
     perform_action "Postfix: basic configuration check" "postfix check"
   fi
 
-  # The interactive "Exim: basic configuration info" action (and its prompt) has been removed
-  # as requested so the script will no longer print:
-  # Action: Exim: basic configuration info
-  # Apply?   [ YES ]  [ NO ]
+  # If you still want a non-interactive Exim info output (without prompting), you can enable:
+  # if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
+  #   log_info "Exim info: $(exim -bV 2>/dev/null || true)"
+  # fi
 }
 
 _print_summary(){
@@ -391,26 +425,26 @@ EOF
 }
 
 main(){
-if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
-  
-# Big pixel-art QHTL logo (with double space between T and L)
-echo -e "${GREEN}"
-echo -e "   █████  █   █  █████        █      █        █   "
-echo -e "  █     █ █   █    █          █               █  █"
-echo -e "  █     █ █   █    █          █      █  █     █ █ "
-echo -e "  █     █ █████    █          █      █  ████  ██  "
-echo -e "  █     █ █   █    █          █████  █  █   █ █ █ "
-echo -e "   █████  █   █    █          █████  █  █   █ █  █"
-echo -e "${NC}"
+  if [[ -t 1 ]]; then tput clear 2>/dev/null || printf '\033[H\033[2J'; fi
 
-# Red bold capital Daniel Nowakowski below logo
-echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+  # Big pixel-art QHTL logo (with double space between T and L)
+  echo -e "${GREEN}"
+  echo -e "   █████  █   █  █████        █      █        █   "
+  echo -e "  █     █ █   █    █          █               █  █"
+  echo -e "  █     █ █   █    █          █      █  █     █ █ "
+  echo -e "  █     █ █████    █          █      █  ████  ██  "
+  echo -e "  █     █ █   █    █          █████  █  █   █ █ █ "
+  echo -e "   █████  █   █    █          █████  █  █   █ █  █"
+  echo -e "${NC}"
 
-# Display QHTL Zero header
-echo -e "${BLUE}========================================================"
-echo -e "        QHTL Zero Configurator SMTP Hardening    "
-echo -e "========================================================${NC}"
-echo -e ""
+  # Red bold capital Daniel Nowakowski below logo
+  echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+
+  # Display QHTL Zero header
+  echo -e "${BLUE}========================================================"
+  echo -e "        QHTL Zero Configurator SMTP Hardening    "
+  echo -e "========================================================${NC}"
+  echo -e ""
 
   for arg in "$@"; do
     case "$arg" in
@@ -444,8 +478,11 @@ echo -e ""
 
   case "$mail_svc" in
     exim)
-      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tas[...]
-      else log_info "Exim detected — running Exim-specific tasks."; fi
+      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then
+        log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."
+      else
+        log_info "Exim detected — running Exim-specific tasks."
+      fi
       configure_exim; test_configuration
       ;;
     postfix)
