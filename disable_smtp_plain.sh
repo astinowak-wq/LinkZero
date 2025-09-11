@@ -105,73 +105,23 @@ perform_backup() {
 }
 
 # interactive yes/no chooser
-# Updated: read from /dev/tty (or SUDO_TTY) to ensure prompts work even when stdin is redirected.
-# Returns 0 for Yes, 1 for No. If no tty available, defaults to No (returns 1) and informs user.
 choose_yes_no() {
   local prompt="$1"
-  local ttydev=""
-
-  # Prefer /dev/tty, fall back to SUDO_TTY if present and readable
-  if [[ -r /dev/tty ]]; then
-    ttydev="/dev/tty"
-  elif [[ -n "${SUDO_TTY:-}" && -r "${SUDO_TTY}" ]]; then
-    ttydev="${SUDO_TTY}"
-  fi
-
-  if [[ -z "$ttydev" ]]; then
-    # Non-interactive environment: do not attempt to prompt; default to No
-    echo "$prompt"
-    echo "Non-interactive terminal: defaulting to 'No'"
-    return 1
-  fi
-
-  # Open tty for reading single-key input on fd 3
-  exec 3<"$ttydev" 2>/dev/null || return 1
-
-  local sel=0 key rest
-  tput civis >/dev/null 2>&1 || true
+  if ! [[ -t 0 ]]; then echo "$prompt"; echo "Non-interactive terminal: defaulting to 'No'"; return 1; fi
+  local sel=0 key
+  tput civis 2>/dev/null || true
   while true; do
-    # Print prompt to tty (clearing the line first)
-    printf '\r\033[K' >"$ttydev"
+    printf '\r\033[K'
     if [[ $sel -eq 0 ]]; then option_yes="${GREEN}YES${RESET}"; option_no="NO"; else option_yes="YES"; option_no="${RED}NO${RESET}"; fi
-    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no" >"$ttydev"
-
-    # Read a single key (handle escape sequences for arrows)
-    IFS= read -r -n1 -u 3 key 2>/dev/null || key=''
-    if [[ $key == $'\x1b' ]]; then
-      # attempt to read the rest of the escape sequence
-      IFS= read -r -n2 -t 0.0005 -u 3 rest 2>/dev/null || rest=''
-      key+="$rest"
-    fi
-
+    printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
+    IFS= read -rsn1 key 2>/dev/null || key=''
+    if [[ $key == $'\x1b' ]]; then IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''; key+="$rest"; fi
     case "$key" in
-      $'\n'|$'\r'|'')
-        printf "\n" >"$ttydev"
-        tput cnorm >/dev/null 2>&1 || true
-        exec 3<&- 2>/dev/null || true
-        [[ $sel -eq 0 ]] && return 0 || return 1
-        ;;
-      $'\x1b[C'|$'\x1b[D')
-        # toggle selection on left/right arrows (also works with up/down if terminal maps)
-        sel=$((1 - sel))
-        ;;
-      $'\x1b[A'|$'\x1b[B')
-        # Up/Down arrows behave the same
-        sel=$((1 - sel))
-        ;;
-      h|H|l|L)
-        sel=$((1 - sel))
-        ;;
-      q|Q)
-        printf "\n" >"$ttydev"
-        echo -e "${RED}Aborted by user.${RESET}" >"$ttydev"
-        tput cnorm >/dev/null 2>&1 || true
-        exec 3<&- 2>/dev/null || true
-        exit 1
-        ;;
-      *)
-        # ignore other keys
-        ;;
+      $'\n'|$'\r'|'') printf "\n"; tput cnorm 2>/dev/null || true; [[ $sel -eq 0 ]] && return 0 || return 1 ;;
+      $'\x1b[C'|$'\x1b[D') sel=$((1 - sel)) ;;
+      h|H|l|L) sel=$((1 - sel)) ;;
+      q|Q) printf "\n"; echo -e "${RED}Aborted by user.${RESET}"; tput cnorm 2>/dev/null || true; exit 1 ;;
+      *) ;;
     esac
   done
 }
@@ -367,14 +317,14 @@ configure_exim(){
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding to search"; fi
+    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"; fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
     if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then
       local ev; ev="$(exim -bV 2>&1 || true)"
       exim_conf="$(printf '%s\n' "$ev" | sed -nE 's/.*Configuration file[^:]*:[[:space:]]*(.+)$/\1/p' | head -n1 || true)"
-      if [[ -z "$exim_conf" && printf '%s\n' "$ev" | grep -qi '/etc/exim4'; then
+      if [[ -z "$exim_conf" ]] && printf '%s\n' "$ev" | grep -qi '/etc/exim4'; then
         if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"; elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
       fi
       exim_conf="$(echo "$exim_conf" | xargs || true)"
@@ -389,7 +339,7 @@ configure_exim(){
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' '$exim_conf' || true"
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
       local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
@@ -488,7 +438,8 @@ echo -e ""
 
   case "$mail_svc" in
     exim)
-      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."; else log_info "Exim detected — running Exim-specific tasks."; fi
+      if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."
+      else log_info "Exim detected — running Exim-specific tasks."; fi
       configure_exim; test_configuration
       ;;
     postfix)
