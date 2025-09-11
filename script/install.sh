@@ -41,6 +41,24 @@ if [[ $EUID -ne 0 ]]; then
     log_error "This installation script must be run as root"
     exit 1
 fi
+# Big pixel-art QHTL logo (with double space between T and L)
+echo -e "${GREEN}"
+echo -e "   █████  █   █  █████        █      █        █   "
+echo -e "  █     █ █   █    █          █               █  █"
+echo -e "  █     █ █   █    █          █      █  █     █ █ "
+echo -e "  █     █ █████    █          █      █  ████  ██  "
+echo -e "  █     █ █   █    █          █      █  █   █ █ █ "
+echo -e "   █████  █   █    █          █████  █  █   █ █  █"
+echo -e "${NC}"
+
+# Red bold capital Daniel Nowakowski below logo
+echo -e "${RED}${BOLD} a u t h o r :    D A N I E L    N O W A K O W S K I${NC}"
+
+# Display QHTL Zero header
+echo -e "${BLUE}========================================================"
+echo -e "        QHTL Zero Configurator SMTP Hardening    "
+echo -e "========================================================${NC}"
+echo -e ""
 
 log_info "Installing LinkZero SMTP Security Script..."
 
