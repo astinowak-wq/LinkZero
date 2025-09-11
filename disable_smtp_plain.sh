@@ -5,13 +5,10 @@
 # --dry-run mode that produces no side effects on the running system.
 #
 # Changes in this revision:
-# - When printing log messages to the terminal, do NOT print the timestamp
-#   before the [LEVEL] prefix. Timestamps are still written to the logfile.
-# - Behavior:
-#     * Terminal (interactive): prints "[LEVEL] message" (no timestamp)
-#     * Non-interactive (or when output is not a TTY): prints "YYYY-MM-DDTHH:MM:SSZ [LEVEL] message"
-#       so timestamps remain available for automation/redirected output.
-#     * When not --dry-run, all messages (with timestamp) are appended to LOG_FILE.
+# - Do not print lines that begin with an ISO timestamp (e.g. 2025-09-11T04:37:56Z)
+#   to the terminal. Those lines will still be written to the logfile when not
+#   running in dry-run. Interactive terminal output will not include those
+#   timestamp-prefix lines.
 #
 set -euo pipefail
 
@@ -44,7 +41,20 @@ declare -a ACTION_DESCS
 declare -a ACTION_CMDS
 declare -a ACTION_RESULTS   # values: executed / skipped / dry-accepted / failed / already
 
-# Improved log(): don't print timestamps to terminal; keep timestamps in logfile or non-tty output.
+# Filter function: read stdin and drop any line that starts with an ISO timestamp
+# Pattern: YYYY-MM-DDTHH:MM:SSZ (e.g. 2025-09-11T04:37:56Z)
+filter_out_timestamp_lines() {
+  local re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+  while IFS= read -r line; do
+    if [[ ! $line =~ $re ]]; then
+      printf '%s\n' "$line"
+    fi
+  done
+}
+
+# Improved log(): keep timestamps in logfile (and non-interactive output),
+# but when printing to an interactive terminal, do not print any lines that
+# start with the ISO timestamp pattern.
 log() {
   local level="$1"; shift
   local msg="$*"
@@ -52,21 +62,24 @@ log() {
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
   if [[ "${DRY_RUN}" == "true" ]]; then
-    # In dry-run mode: show concise output to terminal when interactive, otherwise include timestamp
+    # In dry-run mode: interactive -> show concise "[LEVEL] message" (no timestamp)
+    # non-interactive -> include timestamp
     if [[ -t 1 ]]; then
-      printf '[%s] %s\n' "$level" "$msg"
+      printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
     else
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
     fi
   else
-    # Append full timestamped entry to logfile (best-effort, don't fail on write)
+    # Persist the full timestamped log entry to logfile (best-effort)
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
 
-    # For interactive terminals, print without timestamp to keep UI clean
+    # Print to stdout:
     if [[ -t 1 ]]; then
-      printf '[%s] %s\n' "$level" "$msg"
+      # Interactive: print the concise "[LEVEL] message" but pipe through filter to
+      # drop any accidental lines that start with timestamp.
+      printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
     else
-      # For non-interactive, print full timestamped line as well (useful when redirecting)
+      # Non-interactive: print full timestamped line
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
     fi
   fi
