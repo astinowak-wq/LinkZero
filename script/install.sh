@@ -263,7 +263,9 @@ if [[ -n "$ACTION" ]]; then
 fi
 
 # Interactive menu using arrow keys + Enter only (no y/n)
-if [[ -t 0 && -t 1 ]]; then
+# Show interactive menu only when BOTH stdin and stdout are TTYs AND neither NONINTERACTIVE nor CI environment vars are set.
+# This reduces accidental interactive prompts when the script is piped or run in CI.
+if [[ -t 0 && -t 1 && -z "${NONINTERACTIVE:-}" && -z "${CI:-}" ]]; then
     options=("Install LinkZero" "Uninstall LinkZero" "Exit")
     sel=0
     tput civis 2>/dev/null || true
@@ -310,7 +312,7 @@ if [[ -t 0 && -t 1 ]]; then
     done
     tput cnorm 2>/dev/null || true
 else
-    # Non-interactive terminal with no action flag: default to install
+    # Non-interactive terminal with no action flag OR NONINTERACTIVE/CI set: default to install
     install_action
 fi
 
