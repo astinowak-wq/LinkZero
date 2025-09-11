@@ -97,48 +97,6 @@ Options:
 EOF
 }
 
-# Prompt helper: ask a yes/no question and then remove the question from the console after the user answers.
-# Usage: prompt_yes_no "Prompt text [y/N] " "n"
-# Returns 0 for yes, 1 for no.
-prompt_yes_no(){
-    local prompt="${1:-Continue? [y/N] }"
-    local default="${2:-n}"
-    local ans
-
-    # Non-interactive: respect the default
-    if [[ ! -t 0 || ! -t 1 ]]; then
-        if [[ "${default,,}" == "y" ]]; then
-            return 0
-        else
-            return 1
-        fi
-    fi
-
-    while true; do
-        # Print prompt and read answer
-        read -r -p "$prompt" ans
-
-        # After the user answers, remove the prompt+answer line from the terminal to avoid leaving the question visible.
-        # Move cursor up one line, then clear line. If tput isn't available or fails, fall back silently.
-        tput cuu1 2>/dev/null || true
-        tput el 2>/dev/null || true
-
-        case "${ans,,}" in
-            y|yes) return 0 ;;
-            n|no|'')
-                if [[ "${default,,}" == "y" ]]; then
-                    return 0
-                else
-                    return 1
-                fi
-                ;;
-            *)
-                # Invalid response: re-prompt (previous prompt was cleared)
-                ;;
-        esac
-    done
-}
-
 # Basic environment checks
 check_cloudlinux(){
     if [[ -f /etc/redhat-release ]] && grep -qi 'cloudlinux' /etc/redhat-release 2>/dev/null; then
@@ -546,13 +504,7 @@ main(){
     fi
 
     if [[ "$RESTORE" == "true" ]]; then
-        # Ask the user to confirm the restore. After the user answers, the question
-        # will be removed from the console (prompt + input are cleared).
-        if prompt_yes_no "Restore latest backup from $BACKUP_DIR? [y/N] " "n"; then
-            restore_configuration
-        else
-            log_info "Restore canceled by user."
-        fi
+        restore_configuration
         exit 0
     fi
 
