@@ -53,11 +53,8 @@ err()    { echo -e "${RED}[ERR]${NC} $*"; }
 # Try to open a terminal on fd 3. Order:
 # 1) /dev/tty
 # 2) SUDO_TTY (if set)
-# 3) don't open anything (we will only use stdin if it's a real tty)
-# Implementation note:
-# Previously this function required a non-blocking read probe to mark fd3 usable.
-# That probe caused failures in some sudo/piped environments. Now we treat a successful
-# exec 3<... as sufficient to indicate a usable terminal fd.
+# 3) nothing (we'll fallback to other reads)
+# We keep fd 3 open when possible and use `read -u 3` which is more reliable than redirection.
 USE_TTY_FD=false
 try_open_tty() {
     # close previous fd3 if any
@@ -85,40 +82,53 @@ try_open_tty() {
     return 1
 }
 
-# read a single key (blocking first byte). Prefer fd3 when available.
-# sets global 'key'
+# read a single key (blocking). Prefer fd3 when available.
+# sets global 'key' to the captured character(s) or empty if no input device was available.
 read_key() {
     key=''
+
+    # 1) If we have fd3 open (pointing at /dev/tty or SUDO_TTY), read from it (blocking).
     if [[ "$USE_TTY_FD" == true ]]; then
-        # read from fd3 (blocking). This allows interactive menus even when stdin is not a tty.
-        IFS= read -rsn1 key <&3 2>/dev/null || key=''
-        if [[ $key == $'\x1b' ]]; then
-            IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || rest=''
-            key+="$rest"
+        # read one byte (blocking), then attempt to read up to 2 more bytes for escape sequences with a short timeout
+        if read -rsn1 -u 3 key 2>/dev/null; then
+            if [[ $key == $'\x1b' ]]; then
+                # read remaining two bytes of escape (non-blocking short timeout)
+                IFS= read -rsn2 -t 0.05 -u 3 rest 2>/dev/null || rest=''
+                key+="$rest"
+            fi
+            return 0
         fi
-    else
-        # only read from stdin if stdin is tty
-        if [[ -t 0 ]]; then
-            IFS= read -rsn1 key 2>/dev/null || key=''
+    fi
+
+    # 2) If stdin is a tty, read directly from stdin (blocking)
+    if [[ -t 0 ]]; then
+        if read -rsn1 key 2>/dev/null; then
             if [[ $key == $'\x1b' ]]; then
                 IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=''
                 key+="$rest"
             fi
-        else
-            key=''
+            return 0
         fi
     fi
 
-    # If we didn't get anything, try one last time reading directly from /dev/tty
-    # This helps environments where fd3 may be closed or stdin is not the input device
-    # that actually receives key presses (some sudo/piped terminals).
-    if [[ -z "$key" && -r /dev/tty ]]; then
-        IFS= read -rsn1 key </dev/tty 2>/dev/null || key=''
-        if [[ $key == $'\x1b' ]]; then
-            IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || rest=''
-            key+="$rest"
+    # 3) Last resort: open /dev/tty temporarily on fd4 and read from it (blocking).
+    # This helps in environments where fd3 wasn't left open but /dev/tty is readable.
+    if [[ -r /dev/tty ]]; then
+        exec 4</dev/tty 2>/dev/null || true
+        if read -rsn1 -u 4 key 2>/dev/null; then
+            if [[ $key == $'\x1b' ]]; then
+                IFS= read -rsn2 -t 0.05 -u 4 rest 2>/dev/null || rest=''
+                key+="$rest"
+            fi
+            exec 4<&- 2>/dev/null || true
+            return 0
         fi
+        exec 4<&- 2>/dev/null || true
     fi
+
+    # no input device available
+    key=''
+    return 1
 }
 
 # parse args
@@ -210,8 +220,10 @@ uninstall_action() {
         echo ""
         echo -n "Confirm removal (y/N): "
         # read a single key for yes/no
-        read_key
-        # normalize key
+        if ! read_key; then
+            warn "No interactive input — cancelling uninstall."
+            return 1
+        fi
         case "$key" in
             [yY]) ;; # proceed
             *) warn "Uninstall cancelled."; return 0 ;;
@@ -290,22 +302,8 @@ redraw_menu() {
 redraw_menu
 
 while true; do
-    read_key
-
-    # if read_key produced empty key, try one more targeted read from /dev/tty before bailing
-    if [[ -z "$key" ]]; then
-        # attempt once more (blocking) from /dev/tty
-        if [[ -r /dev/tty ]]; then
-            IFS= read -rsn1 key </dev/tty 2>/dev/null || key=''
-            if [[ $key == $'\x1b' ]]; then
-                IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || rest=''
-                key+="$rest"
-            fi
-        fi
-    fi
-
-    # if still empty, bail to non-interactive
-    if [[ -z "$key" ]]; then
+    # Read a key (blocking). read_key returns non-zero if no input device was available.
+    if ! read_key; then
         warn "No interactive input read; falling back to non-interactive install."
         tput cnorm 2>/dev/null || true
         exec 3<&- 2>/dev/null || true
@@ -316,7 +314,6 @@ while true; do
     case "$key" in
         $'\n'|$'\r')
             tput cnorm 2>/dev/null || true
-            # use arithmetic evaluation to ensure sel is treated as integer
             case $((sel)) in
                 0)
                     exec 3<&- 2>/dev/null || true
@@ -337,7 +334,6 @@ while true; do
             ;;
         $'\x1b[A'|$'\x1b[D') # up/left
             sel=$(( (sel - 1 + ${#options[@]}) % ${#options[@]} ))
-            # move cursor up the number of menu lines + 1 blank line
             lines_to_move=$(( ${#options[@]} + 1 ))
             tput cuu "$lines_to_move" 2>/dev/null || printf '\033[%dA' "$lines_to_move"
             redraw_menu
