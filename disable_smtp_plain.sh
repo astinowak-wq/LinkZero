@@ -5,10 +5,13 @@
 # --dry-run mode that produces no side effects on the running system.
 #
 # Changes in this revision:
-# - Do not print lines that begin with an ISO timestamp (e.g. 2025-09-11T04:37:56Z)
-#   to the terminal. Those lines will still be written to the logfile when not
-#   running in dry-run. Interactive terminal output will not include those
-#   timestamp-prefix lines.
+# - Terminal output will never show the actual command text. Any place that
+#   previously printed command text to the terminal (e.g. "Planned command for action: ...")
+#   now prints a redacted placeholder "[command hidden]" while the full command is still
+#   written to the logfile for auditing.
+# - Implemented a log_cmd helper that writes the full message+command to the logfile
+#   but prints a redacted version to interactive terminals. Non-interactive output
+#   still shows full timestamped lines.
 #
 set -euo pipefail
 
@@ -52,9 +55,8 @@ filter_out_timestamp_lines() {
   done
 }
 
-# Improved log(): keep timestamps in logfile (and non-interactive output),
-# but when printing to an interactive terminal, do not print any lines that
-# start with the ISO timestamp pattern.
+# Standard logger for simple messages (no commands). Keeps timestamps in logfile,
+# and prints clean level-prefixed lines to interactive terminal.
 log() {
   local level="$1"; shift
   local msg="$*"
@@ -62,24 +64,18 @@ log() {
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
   if [[ "${DRY_RUN}" == "true" ]]; then
-    # In dry-run mode: interactive -> show concise "[LEVEL] message" (no timestamp)
-    # non-interactive -> include timestamp
     if [[ -t 1 ]]; then
-      printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
+      printf '[%s] %s\n' "$level" "$msg"
     else
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
     fi
   else
-    # Persist the full timestamped log entry to logfile (best-effort)
+    # write timestamped entry to logfile
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
 
-    # Print to stdout:
     if [[ -t 1 ]]; then
-      # Interactive: print the concise "[LEVEL] message" but pipe through filter to
-      # drop any accidental lines that start with timestamp.
       printf '[%s] %s\n' "$level" "$msg" | filter_out_timestamp_lines
     else
-      # Non-interactive: print full timestamped line
       printf '%s [%s] %s\n' "$ts" "$level" "$msg"
     fi
   fi
@@ -87,6 +83,37 @@ log() {
 log_info(){ log "INFO" "$@"; }
 log_error(){ log "ERROR" "$@"; }
 log_success(){ log "SUCCESS" "$@"; }
+
+# New helper: log a message that includes a command.
+# - Writes the full timestamped message including the real command to the logfile.
+# - Prints a redacted message to interactive terminals (command replaced with "[command hidden]").
+# - For non-interactive output prints the full timestamped line (so automation/redirects retain full info).
+log_cmd() {
+  local level="$1"; shift
+  local msg="$1"; shift
+  local cmd="$*"
+  local ts
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+  # Append full info to logfile (best-effort)
+  printf '%s [%s] %s: %s\n' "$ts" "$level" "$msg" "$cmd" >> "$LOG_FILE" 2>/dev/null || true
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    if [[ -t 1 ]]; then
+      printf '[%s] %s: %s\n' "$level" "$msg" "[command hidden]"
+    else
+      printf '%s [%s] %s: %s\n' "$ts" "$level" "$msg" "$cmd"
+    fi
+  else
+    if [[ -t 1 ]]; then
+      # interactive -> hide the actual command text
+      printf '[%s] %s: %s\n' "$level" "$msg" "[command hidden]" | filter_out_timestamp_lines
+    else
+      # non-interactive -> show full timestamped line
+      printf '%s [%s] %s: %s\n' "$ts" "$level" "$msg" "$cmd"
+    fi
+  fi
+}
 
 # Robust CSF presence check.
 csf_present() {
@@ -273,14 +300,18 @@ choose_yes_no() {
     return 1
   fi
 
+  # selection: 0 = YES, 1 = NO
   local sel=0
   local key
 
+  # hide cursor if possible
   tput civis 2>/dev/null || true
 
   while true; do
+    # clear line and render prompt with colored selected option
     printf '\r\033[K'
 
+    # Selected option uses color, unselected uses terminal default color
     if [[ $sel -eq 0 ]]; then
       option_yes="${GREEN}YES${RESET}"
       option_no="NO"
@@ -289,17 +320,21 @@ choose_yes_no() {
       option_no="${RED}NO${RESET}"
     fi
 
+    # Prompt remains highlighted so it's obvious what you're answering; options are not bold.
     printf "%b%s%b   [ %b ]  [ %b ]" "${CYAN}${BOLD}" "$prompt" "${RESET}" "$option_yes" "$option_no"
 
+    # read one key (raw, silent)
     IFS= read -rsn1 key 2>/dev/null || key=''
 
+    # If it's an escape, read remaining bytes of the sequence (arrow keys)
     if [[ $key == $'\x1b' ]]; then
+      # read up to two more bytes (common CSI sequences are 3 bytes total)
       IFS= read -rsn2 -t 0.0005 rest 2>/dev/null || rest=''
       key+="$rest"
     fi
 
     case "$key" in
-      $'\n'|$'\r'|'')
+      $'\n'|$'\r'|'')   # Enter pressed
         printf "\n"
         tput cnorm 2>/dev/null || true
         if [[ $sel -eq 0 ]]; then
@@ -308,7 +343,7 @@ choose_yes_no() {
           return 1
         fi
         ;;
-      $'\x1b[C'|$'\x1b[D')
+      $'\x1b[C'|$'\x1b[D')  # Right or Left arrow
         sel=$((1 - sel))
         ;;
       h|H|l|L)
@@ -321,6 +356,7 @@ choose_yes_no() {
         exit 1
         ;;
       *)
+        # ignore other keys
         ;;
     esac
   done
@@ -338,16 +374,21 @@ perform_action(){
 
   ACTION_DESCS+=("$desc")
   ACTION_CMDS+=("$cmd")
-  log_info "Planned command for action: $cmd"
+
+  # log planned command, but print only redacted form to terminal
+  log_cmd "INFO" "Planned command for action" "$cmd"
 
   if choose_yes_no "Apply?"; then
+    # User answered YES
     if [[ "${DRY_RUN}" == "true" ]]; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied (dry-run)" "${RESET}"
       ACTION_RESULTS+=("dry-accepted")
-      log_info "DRY-RUN: would run: $cmd"
+      # record dry-run intention in logfile with full command, but redact on terminal
+      log_cmd "INFO" "DRY-RUN: would run" "$cmd"
       return 0
     fi
 
+    # Attempt execution (no command echoed to terminal)
     if eval "$cmd"; then
       printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
       log_success "$desc"
@@ -360,9 +401,11 @@ perform_action(){
       return 1
     fi
   else
+    # User answered NO -> show rejection message in red (no "Skipped:" line)
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped")
-    log_info "User rejected action: $desc (command: $cmd)"
+    # log rejection, but redact the command in terminal output
+    log_cmd "INFO" "User rejected action: $desc" "$cmd"
     return 0
   fi
 }
