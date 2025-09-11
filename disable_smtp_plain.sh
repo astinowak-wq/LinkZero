@@ -461,7 +461,7 @@ test_configuration(){
     case "$ms" in
         postfix)
             if command -v postfix >/dev/null 2>&1; then
-                if "$DRY_RUN" == "false"; then
+                if [[ "$DRY_RUN" == "false" ]]; then
                     if postfix check >/dev/null 2>&1; then
                         log_success "postfix check OK"
                     else
@@ -475,7 +475,7 @@ test_configuration(){
             ;;
         exim)
             if command -v exim >/dev/null 2>&1; then
-                if "$DRY_RUN" == "false"; then
+                if [[ "$DRY_RUN" == "false" ]]; then
                     if exim -bV >/dev/null 2>&1; then
                         log_success "exim basic check OK"
                     else
