@@ -2,11 +2,7 @@
 #
 # LinkZero installer — numeric-menu main menu (looping) with reliable tty IO
 #
-# Updates:
-# - Removed delay/countdown for pre-autostart option "3) none": when selected the installer
-#   will return to the main menu immediately after install.
-# - Countdown for options that do use it (launch/dry) is now shown on a single line
-#   (overwrites the same line each second).
+# Update: removed all countdowns — actions (launch / dry / none) occur immediately.
 #
 set -euo pipefail
 
@@ -183,7 +179,7 @@ choose_prelaunch_mode() {
 
     printf "\n" >"$OUTPUT_PATH"
     printf "%b\n" "${ORANGE}Select what should happen after installation for this run:${NC}" >"$OUTPUT_PATH"
-    printf " 1) launch     - start program in foreground after countdown\n" >"$OUTPUT_PATH"
+    printf " 1) launch     - start program in foreground immediately\n" >"$OUTPUT_PATH"
     printf " 2) dry        - run installed binary with --dry-run (do NOT start normally)\n" >"$OUTPUT_PATH"
     printf " 3) none       - do NOT start program after install (return to main menu)\n" >"$OUTPUT_PATH"
     printf "\n" >"$OUTPUT_PATH"
@@ -196,40 +192,30 @@ choose_prelaunch_mode() {
     esac
 }
 
-# Countdown + apply mode
-# - For "none": do NOT do a countdown; return immediately.
-# - For "launch" and "dry": show a single-line countdown that overwrites itself.
+# Apply selected mode immediately (no countdown)
+# modes:
+#  - dry  -> run installed binary with --dry-run (attached to /dev/tty if possible)
+#  - none -> do nothing, return to caller immediately
+#  - launch-> start installed binary (attached if possible) and then exit installer
 countdown_and_apply_mode() {
     local install_path="$1"
     local mode="$2"
-    local seconds=5
     open_io
     local out="$OUTPUT_PATH"
 
-    if [[ "$mode" == "none" ]]; then
-        printf "%b\n" "${YELLOW}Autostart disabled for this run; not launching.${NC}" >"$out"
-        return 0
-    fi
-
-    # single-line countdown: overwrite same line each second
-    for ((i=seconds;i>=1;i--)); do
-        # \r to return to line start, \033[K to erase to end of line
-        printf "\r\033[KStarting in %d..." "$i" >"$out"
-        sleep 1
-    done
-    # clear the countdown line after finishing
-    printf "\r\033[K" >"$out"
-
     case "$mode" in
+        none)
+            printf "%b\n" "${YELLOW}Autostart disabled for this run; not launching.${NC}" >"$out"
+            return 0
+            ;;
         dry)
             if [[ ! -x "$install_path" ]]; then
                 printf "%b\n" "${YELLOW}Installed file missing or not executable: ${install_path}${NC}" >"$out"
                 return 0
             fi
             printf "%b\n" "${GREEN}Running dry-run: ${install_path} --dry-run${NC}" >"$out"
-            # Run attached to /dev/tty if available so user can see output; do NOT replace installer process.
             if [[ -w /dev/tty ]]; then
-                # run in subshell attached to tty and wait
+                # run attached to tty and wait (subshell so installer is not replaced)
                 ( "$install_path" --dry-run </dev/tty >/dev/tty 2>/dev/tty )
             else
                 # no tty; run detached so installer can continue/exit cleanly
@@ -243,7 +229,6 @@ countdown_and_apply_mode() {
                 return 0
             fi
             printf "%b\n" "${GREEN}Launching ${install_path} (attached if possible)${NC}" >"$out"
-            # Try to run attached to /dev/tty in a subshell so we don't replace the installer process.
             if [[ -w /dev/tty ]]; then
                 ( "$install_path" </dev/tty >/dev/tty 2>/dev/tty ) &
             else
@@ -279,7 +264,7 @@ install_action() {
     open_io
     chosen_mode="$(choose_prelaunch_mode)"
 
-    # If chosen "none", do NOT wait/countdown and return immediately to the main menu.
+    # Apply selected mode immediately (no countdown)
     countdown_and_apply_mode "$install_path" "$chosen_mode"
 
     if [[ "$chosen_mode" == "none" ]]; then
