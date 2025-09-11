@@ -4,16 +4,8 @@
 # Harden Postfix/Exim by disabling plaintext auth methods and provide a strict
 # --dry-run mode that produces no side effects on the running system.
 #
-# Display change in this revision:
-# - The "[INFO] Detected mail server" line now prints the service with:
-#     CapitalizedName (version) (assumed cPanel)
-#   Examples:
-#     [INFO] Detected mail server: Exim (4.94) (assumed cPanel)
-#     [INFO] Detected mail server: Exim (4.94) (cPanel)
-#     [INFO] Detected mail server: Postfix
-#
-# Other behavior: backups are non-interactive and use .link0; commands logged
-# to LOG_FILE only. Edits/restarts remain interactive.
+# This is a cleaned, LF-only, complete script (no truncated lines or "..." placeholders).
+# The interactive Exim "exim -bV" perform_action was removed per prior request.
 #
 set -euo pipefail
 
@@ -139,8 +131,13 @@ perform_action(){
       ACTION_RESULTS+=("dry-accepted"); log_command_to_file_only "INFO" "DRY-RUN: would run" "$cmd"; return 0
     fi
     log_command_to_file_only "INFO" "Executing command" "$cmd"
-    if eval "$cmd"; then printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"; log_success "$desc"; ACTION_RESULTS+=("executed"); return 0
-    else printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"; log_error "$desc failed"; ACTION_RESULTS+=("failed"); return 1; fi
+    if eval "$cmd"; then
+      printf "%b%s%b\n" "${GREEN}" "Changes has been successfully applied" "${RESET}"
+      ACTION_RESULTS+=("executed"); log_success "$desc"; return 0
+    else
+      printf "%b%s%b\n" "${RED}" "Changes failed during execution" "${RESET}"
+      ACTION_RESULTS+=("failed"); log_error "$desc failed"; return 1
+    fi
   else
     printf "%b%s%b\n" "${RED}" "Changes has been rejected by user" "${RESET}"
     ACTION_RESULTS+=("skipped"); log_command_to_file_only "INFO" "User rejected action" "$desc -- command: $cmd"; return 0
@@ -156,9 +153,12 @@ csf_present() {
   [[ -d /etc/csf || -d /usr/local/csf || -x /usr/sbin/csf ]] && return 0
   return 1
 }
+
 detect_active_firewall() {
   if csf_present; then echo "csf"; return 0; fi
-  if command -v nft >/dev/null 2>&1; then if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi; fi
+  if command -v nft >/dev/null 2>&1; then 
+    if systemctl is-active --quiet nftables 2>/dev/null || nft list ruleset >/dev/null 2>&1; then echo "nftables"; return 0; fi
+  fi
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then echo "firewalld"; return 0; fi
     if systemctl is-active --quiet firewalld 2>/dev/null; then echo "firewalld"; return 0; fi
@@ -288,11 +288,18 @@ capitalize_first() {
 
 configure_postfix(){
   log_info "Configuring Postfix to require TLS for AUTH"
-  if ! command -v postconf >/dev/null 2>&1; then log_info "postconf not present; skipping Postfix configuration"; return 0; fi
+  if ! command -v postconf >/dev/null 2>&1; then 
+    log_info "postconf not present; skipping Postfix configuration"
+    return 0
+  fi
   perform_action "Set Postfix: smtpd_tls_auth_only = yes" "postconf -e 'smtpd_tls_auth_only = yes'"
   perform_action "Set Postfix: smtpd_tls_security_level = may" "postconf -e 'smtpd_tls_security_level = may'"
   perform_action "Set Postfix: smtpd_sasl_auth_enable = yes" "postconf -e 'smtpd_sasl_auth_enable = yes'"
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Postfix via systemctl" "systemctl restart postfix"; else perform_action "Restart Postfix via service" "service postfix restart"; fi
+  if command -v systemctl >/dev/null 2>&1; then 
+    perform_action "Restart Postfix via systemctl" "systemctl restart postfix"
+  else 
+    perform_action "Restart Postfix via service" "service postfix restart"
+  fi
 }
 
 configure_exim(){
@@ -317,7 +324,11 @@ configure_exim(){
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"; fi
+    if [[ -n "$exim_conf" ]]; then 
+      log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"
+    else 
+      log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"
+    fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
@@ -325,11 +336,22 @@ configure_exim(){
       local ev; ev="$(exim -bV 2>&1 || true)"
       exim_conf="$(printf '%s\n' "$ev" | sed -nE 's/.*Configuration file[^:]*:[[:space:]]*(.+)$/\1/p' | head -n1 || true)"
       if [[ -z "$exim_conf" ]] && printf '%s\n' "$ev" | grep -qi '/etc/exim4'; then
-        if [[ -f /etc/exim4/exim4.conf.template ]]; then exim_conf="/etc/exim4/exim4.conf.template"; elif [[ -d /etc/exim4 ]]; then exim_conf="/etc/exim4"; fi
+        if [[ -f /etc/exim4/exim4.conf.template ]]; then 
+          exim_conf="/etc/exim4/exim4.conf.template"
+        elif [[ -d /etc/exim4 ]]; then 
+          exim_conf="/etc/exim4"
+        fi
       fi
       exim_conf="$(echo "$exim_conf" | xargs || true)"
-      if [[ -n "$exim_conf" && -f "$exim_conf" ]]; then log_info "Discovered Exim configuration via 'exim -bV': ${exim_conf}"; else
-        if [[ -d /etc/exim4/conf.d ]]; then exim_conf="/etc/exim4"; log_info "Detected exim4 split-config directory: ${exim_conf}"; else exim_conf=""; fi
+      if [[ -n "$exim_conf" && -f "$exim_conf" ]]; then 
+        log_info "Discovered Exim configuration via 'exim -bV': ${exim_conf}"
+      else
+        if [[ -d /etc/exim4/conf.d ]]; then 
+          exim_conf="/etc/exim4"
+          log_info "Detected exim4 split-config directory: ${exim_conf}"
+        else 
+          exim_conf=""
+        fi
       fi
     fi
   fi
@@ -350,14 +372,19 @@ configure_exim(){
     log_info "Exim configuration not located; skipping config-file edits"
   fi
 
-  if command -v systemctl >/dev/null 2>&1; then perform_action "Restart Exim via systemctl" "systemctl restart exim4 || systemctl restart exim || true"
-  else perform_action "Restart Exim via service" "service exim4 restart || service exim restart || true"; fi
+  if command -v systemctl >/dev/null 2>&1; then 
+    perform_action "Restart Exim via systemctl" "systemctl restart exim4 || systemctl restart exim || true"
+  else 
+    perform_action "Restart Exim via service" "service exim4 restart || service exim restart || true"
+  fi
 }
 
 test_configuration(){
   log_info "Running basic mail-server checks (prompted)"
-  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then perform_action "Postfix: basic configuration check" "postfix check"; fi
-  if [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]] || command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then perform_action "Exim: basic configuration info" "exim -bV"; fi
+  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then 
+    perform_action "Postfix: basic configuration check" "postfix check"
+  fi
+  # Note: Interactive Exim info action removed from dry-run path per requirements
 }
 
 _print_summary(){
