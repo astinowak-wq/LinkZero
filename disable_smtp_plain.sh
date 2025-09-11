@@ -116,6 +116,58 @@ detect_mail_server(){
     echo "$ms"
 }
 
+# New helper: try to detect any listening MTA/process name if above detection failed.
+# If it finds a process listening on port 25 it will return the process name.
+# Otherwise it will try to find common sendmail binary or other MTA binaries.
+detect_unknown_mta(){
+    local proc_name=""
+
+    # Try ss (modern systems)
+    if command -v ss >/dev/null 2>&1; then
+        # ss output typically contains users:(("process",pid=123,fd=..))
+        proc_name="$(ss -ltnp 2>/dev/null | awk '/:25 /{
+            if (match($0, /users:\(\(\"([^"]+)"/, m)) { print m[1]; exit }
+        }')"
+    fi
+
+    # Try netstat if ss not available or didn't match
+    if [[ -z "$proc_name" && command -v netstat >/dev/null 2>&1 ]]; then
+        # netstat -ltnp usually shows "... 0.0.0.0:25 ...  pid/process"
+        proc_name="$(netstat -ltnp 2>/dev/null | awk '/:25 /{
+            if (match($0, /\\/[[:alnum:]_\\-\\.]+$/, m)) {
+                # extract last part after slash
+                n=m[0]; sub(".*/","",n); print n; exit
+            }
+        }')"
+    fi
+
+    # Try lsof as another fallback
+    if [[ -z "$proc_name" && command -v lsof >/dev/null 2>&1 ]]; then
+        local pid
+        pid="$(lsof -nP -iTCP:25 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
+        if [[ -n "$pid" ]]; then
+            proc_name="$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')"
+        fi
+    fi
+
+    # If still empty, check for common MTA binaries (may be symlinked)
+    if [[ -z "$proc_name" ]]; then
+        for bin in /usr/sbin/sendmail /usr/sbin/qmail-send /usr/sbin/exim /usr/sbin/smtp /usr/sbin/postfix /usr/sbin/opensmtpd /usr/sbin/smtpd; do
+            if [[ -x "$bin" ]]; then
+                proc_name="$(basename "$(readlink -f "$bin" 2>/dev/null || echo "$bin")")"
+                break
+            fi
+        done
+    fi
+
+    # As a last resort try the generic sendmail command in PATH
+    if [[ -z "$proc_name" && -n "$(command -v sendmail 2>/dev/null || true)" ]]; then
+        proc_name="$(basename "$(readlink -f "$(command -v sendmail)" 2>/dev/null || command -v sendmail)")"
+    fi
+
+    echo "$proc_name"
+}
+
 backup_configs(){
     log_info "Creating backups..."
     local ms
@@ -474,8 +526,17 @@ main(){
     local ms
     ms="$(detect_mail_server)"
     if [[ -z "$ms" ]]; then
-        log_error "No supported mail server detected (Postfix/Exim/Sendmail). Aborting."
-        exit 5
+        # Try to detect any MTA/process name even if it's not one of the known explicit ones
+        local unknown_mta
+        unknown_mta="$(detect_unknown_mta || true)"
+        if [[ -n "$unknown_mta" ]]; then
+            log_info "Detected an MTA process or binary: $unknown_mta (unknown type)"
+            ms="$unknown_mta"
+        else
+            # Per request: print message when no MTA found
+            log_error "MTA do not exist on this server"
+            exit 5
+        fi
     fi
 
     log_info "Detected mail server: $ms"
@@ -491,7 +552,8 @@ main(){
             log_warn "Sendmail detected: manual configuration recommended to enforce TLS before AUTH"
             ;;
         *)
-            log_error "Unsupported mail server: $ms"
+            # Unknown MTA name detected; no automated configuration available.
+            log_warn "Detected unknown MTA: $ms. Manual review required – automatic enforcement not implemented for this MTA."
             ;;
     esac
 
