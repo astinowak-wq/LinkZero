@@ -43,9 +43,6 @@ MAIL_SERVER_VARIANT=""
 MAIL_SERVER_VARIANT_ASSUMED=""  # "assumed" when variant inferred from cPanel markers only
 EXIM_VERSION="unknown"
 
-# New global to hold the mail server detected by detect_active_mailserver()
-MAIL_SERVER_DETECTED=""
-
 # hide timestamp-prefixed lines on terminal
 filter_out_timestamp_lines() {
   local re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
@@ -320,7 +317,7 @@ configure_exim(){
       local found; found="$(find /var/cpanel /etc -maxdepth 2 -type f -iname '*exim*.conf' 2>/dev/null | head -n1 || true)"
       [[ -n "$found" ]] && exim_conf="$found"
     fi
-    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding conservatively"; fi
+    if [[ -n "$exim_conf" ]]; then log_info "Detected Exim (cPanel) installation; using config: ${exim_conf}"; else log_info "cPanel detected but Exim config not found in common cPanel locations; proceeding best-effort"; fi
   fi
 
   if [[ -z "$exim_conf" ]]; then
@@ -342,7 +339,7 @@ configure_exim(){
     if [[ -d "$exim_conf" && "$(basename "$exim_conf")" == "exim4" ]]; then
       local backup_cmd="tar -czf '${exim_conf}.link0.${timestamp}.tgz' -C '$(dirname "$exim_conf")' '$(basename "$exim_conf")' || true"
       perform_backup "Backup Exim split-config directory" "$backup_cmd"
-      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_N[...]
+      perform_action "Remove AUTH_CLIENT_ALLOW_NOTLS from Exim split-config (conf.d) files" "grep -R --line-number 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true; sed -i.link0 -E '/AUTH_CLIENT_ALLOW_NOTLS/Id' \$(grep -R --files-with-matches 'AUTH_CLIENT_ALLOW_NOTLS' '$exim_conf' || true) || true"
     else
       local backup_cmd="cp -a '$exim_conf' '${exim_conf}.link0.${timestamp}' || true"
       local sed_cmd="sed -i.link0 -E 's/^\\s*AUTH_CLIENT_ALLOW_NOTLS\\b.*//I' '$exim_conf' || true"
@@ -357,46 +354,10 @@ configure_exim(){
   else perform_action "Restart Exim via service" "service exim4 restart || service exim restart || true"; fi
 }
 
-# Modified: test_configuration now accepts an optional parameter indicating which
-# mail server was detected. This prevents running Exim/Postfix checks
-# unconditionally — checks are only run for the detected service, or for both
-# when detection returned "none" (fallback).
 test_configuration(){
-  local svc="${1:-${MAIL_SERVER_DETECTED:-}}"
-  log_info "Running basic mail-server checks (prompted) [target=${svc:-auto}]"
-
-  case "$svc" in
-    exim)
-      if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1 || [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
-        perform_action "Exim: basic configuration info" "exim -bV"
-      else
-        log_info "Exim not present; skipping Exim checks"
-      fi
-      ;;
-    postfix)
-      if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then
-        perform_action "Postfix: basic configuration check" "postfix check"
-      else
-        log_info "Postfix not present; skipping Postfix checks"
-      fi
-      ;;
-    none|"")
-      # Fallback: run checks only for binaries that actually exist or when cPanel implies Exim
-      if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then
-        perform_action "Postfix: basic configuration check" "postfix check"
-      else
-        log_info "Postfix not present; skipping Postfix checks"
-      fi
-      if command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1 || [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]]; then
-        perform_action "Exim: basic configuration info" "exim -bV"
-      else
-        log_info "Exim not present; skipping Exim checks"
-      fi
-      ;;
-    *)
-      log_info "Unknown target for test_configuration: ${svc}; skipping checks"
-      ;;
-  esac
+  log_info "Running basic mail-server checks (prompted)"
+  if command -v postfix >/dev/null 2>&1 || command -v postconf >/dev/null 2>&1; then perform_action "Postfix: basic configuration check" "postfix check"; fi
+  if [[ "${MAIL_SERVER_VARIANT}" == "cPanel" ]] || command -v exim >/dev/null 2>&1 || command -v exim4 >/dev/null 2>&1; then perform_action "Exim: basic configuration info" "exim -bV"; fi
 }
 
 _print_summary(){
@@ -460,9 +421,6 @@ echo -e ""
   local mail_svc
   mail_svc="$(detect_active_mailserver)"
 
-  # store detected mail server in a global to be used by other helpers
-  MAIL_SERVER_DETECTED="${mail_svc}"
-
   # Build display label: CapitalizedName (version) (assumed cPanel)
   local svc_disp; svc_disp="$(capitalize_first "$mail_svc")"
   local variant_display=""
@@ -482,15 +440,15 @@ echo -e ""
     exim)
       if [[ -n "${MAIL_SERVER_VARIANT}" ]]; then log_info "Exim detected (variant: ${MAIL_SERVER_VARIANT}${MAIL_SERVER_VARIANT_ASSUMED:+, ${MAIL_SERVER_VARIANT_ASSUMED}}) — running Exim-specific tasks."
       else log_info "Exim detected — running Exim-specific tasks."; fi
-      configure_exim; test_configuration exim
+      configure_exim; test_configuration
       ;;
     postfix)
       log_info "Postfix detected — running Postfix-specific tasks."
-      configure_postfix; test_configuration postfix
+      configure_postfix; test_configuration
       ;;
     none|*)
       log_info "No mail server detected; attempting both Exim and Postfix tasks (fallback)."
-      configure_exim; configure_postfix; test_configuration none
+      configure_exim; configure_postfix; test_configuration
       ;;
   esac
 
