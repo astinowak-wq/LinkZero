@@ -213,7 +213,7 @@ main(){
     # parse args (only --dry-run currently)
     for arg in "$@"; do
         case "$arg" in
-            --dry-run) DRY_RUN=true ;; 
+            --dry-run) DRY_RUN=true ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown option: $arg"; usage; exit 2 ;;
         esac
